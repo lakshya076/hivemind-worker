@@ -46,3 +46,71 @@ By default:
 - **Fleet API Key Authentication**: Rejects unauthenticated requests with HTTP 401.
 - **Workspace Isolation**: Git operations and file edits are strictly scoped to the assigned task directory.
 - **Stripped Subprocess Environment**: Subprocesses receive only essential execution variables (`PATH`, git user config, target API keys) — no host SSH keys or personal credentials.
+
+---
+
+## 🔄 Running as a Background Service (Auto-Start on Boot)
+
+### 🐧 Linux (systemd service)
+
+1. Save configuration once on the worker:
+   ```bash
+   hivemind-worker start --key <FLEET_KEY> --port 7422 --save
+   ```
+
+2. Create `/etc/systemd/system/hivemind-worker.service`:
+   ```ini
+   [Unit]
+   Description=HiveMind Worker Daemon
+   After=network.target tailscaled.service
+
+   [Service]
+   Type=simple
+   User=lakshya
+   Environment="PATH=/home/lakshya/.local/bin:/usr/local/bin:/usr/bin:/bin"
+   ExecStart=/home/lakshya/.local/bin/hivemind-worker start
+   Restart=always
+   RestartSec=5
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+   *(Update `User` and binary path to match your environment).*
+
+3. Enable and start:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now hivemind-worker
+   ```
+
+4. Check logs:
+   ```bash
+   journalctl -u hivemind-worker -f
+   ```
+
+---
+
+### 🪟 Windows (Task Scheduler or NSSM)
+
+#### Option 1: Windows Task Scheduler (Native)
+Run in PowerShell as Administrator:
+```powershell
+# Save settings first
+hivemind-worker start --key <FLEET_KEY> --port 7422 --save
+
+# Register auto-start task on logon
+$Action = New-ScheduledTaskAction -Execute "hivemind-worker.exe" -Argument "start"
+$Trigger = New-ScheduledTaskTrigger -AtLogOn
+$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName "HiveMindWorker" -Action $Action -Trigger $Trigger -Settings $Settings -Description "HiveMind Worker AI Fleet Daemon"
+```
+
+#### Option 2: Windows Service via NSSM
+```powershell
+$WorkerPath = (Get-Command hivemind-worker).Source
+nssm install HiveMindWorker $WorkerPath "start"
+nssm set HiveMindWorker AppStdout "$env:USERPROFILE\.hivemind\worker-service.log"
+nssm set HiveMindWorker AppStderr "$env:USERPROFILE\.hivemind\worker-service.log"
+nssm start HiveMindWorker
+```
+
