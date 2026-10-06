@@ -18,8 +18,8 @@ pip install hivemind-worker
 ### 2. Run Worker Daemon
 
 ```bash
-# Start the daemon with API key
-hivemind-worker start --key <YOUR_API_KEY> --port 7422
+# Start the daemon with FLEET key
+hivemind-worker start --key <YOUR_FLEET_KEY> --port 7422
 ```
 
 By default:
@@ -66,9 +66,9 @@ By default:
 
    [Service]
    Type=simple
-   User=lakshya
-   Environment="PATH=/home/lakshya/.local/bin:/usr/local/bin:/usr/bin:/bin"
-   ExecStart=/home/lakshya/.local/bin/hivemind-worker start
+   User=<username>
+   Environment="PATH=/home/<username>/.local/bin:/usr/local/bin:/usr/bin:/bin"
+   ExecStart=/home/<username/.local/bin/hivemind-worker start
    Restart=always
    RestartSec=5
 
@@ -90,9 +90,37 @@ By default:
 
 ---
 
-### 🪟 Windows (Task Scheduler or NSSM)
+### 🪟 Windows
 
-#### Option 1: Windows Task Scheduler (Native)
+#### Method 1: Run in Background for Current Session (No Auto-Startup)
+
+If you only want to run the worker in the background during your current session (stops when closed or rebooted):
+
+* **Option A: Hidden Background Process (PowerShell)**
+  ```powershell
+  Start-Process -WindowStyle Hidden -FilePath "hivemind-worker" -ArgumentList "start" -RedirectStandardOutput "$env:USERPROFILE\.hivemind\worker.log" -RedirectStandardError "$env:USERPROFILE\.hivemind\worker.log"
+  ```
+  *To stop the background worker:*
+  ```powershell
+  Stop-Process -Name "hivemind-worker" -Force
+  ```
+
+* **Option B: PowerShell Background Job**
+  ```powershell
+  Start-Job -Name "HiveMindWorker" -ScriptBlock { hivemind-worker start }
+  ```
+  *To view status, logs, or stop:*
+  ```powershell
+  Get-Job -Name "HiveMindWorker"
+  Receive-Job -Name "HiveMindWorker" -Keep   # View logs
+  Stop-Job -Name "HiveMindWorker"           # Stop job
+  ```
+
+---
+
+#### Method 2: Auto-Start on System Startup / Logon
+
+##### Option A: Windows Task Scheduler (Native)
 Run in PowerShell as Administrator:
 ```powershell
 # Save settings first
@@ -105,7 +133,7 @@ $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 Register-ScheduledTask -TaskName "HiveMindWorker" -Action $Action -Trigger $Trigger -Settings $Settings -Description "HiveMind Worker AI Fleet Daemon"
 ```
 
-#### Option 2: Windows Service via NSSM
+##### Option B: Windows Service via NSSM (Runs even when logged out)
 ```powershell
 $WorkerPath = (Get-Command hivemind-worker).Source
 nssm install HiveMindWorker $WorkerPath "start"
@@ -113,4 +141,5 @@ nssm set HiveMindWorker AppStdout "$env:USERPROFILE\.hivemind\worker-service.log
 nssm set HiveMindWorker AppStderr "$env:USERPROFILE\.hivemind\worker-service.log"
 nssm start HiveMindWorker
 ```
+
 
