@@ -49,9 +49,9 @@ By default:
 
 ---
 
-## 🔄 Running as a Background Service (Auto-Start on Boot)
+## 🔄 Running as a Background Service
 
-### 🐧 Linux (systemd service)
+### Linux (systemd service)
 
 1. Save configuration once on the worker:
    ```bash
@@ -90,7 +90,7 @@ By default:
 
 ---
 
-### 🪟 Windows
+### Windows
 
 #### Method 1: Run in Background for Current Session (No Auto-Startup)
 
