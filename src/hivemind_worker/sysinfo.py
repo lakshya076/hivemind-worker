@@ -2,6 +2,7 @@ import os
 import platform
 import shutil
 import subprocess
+from pathlib import Path
 from typing import List, Tuple
 import psutil
 
@@ -10,8 +11,26 @@ from hivemind_worker.models import HealthResponse
 
 
 def is_tool_installed(name: str) -> bool:
-    """Check if an executable is found on system PATH."""
-    return shutil.which(name) is not None
+    """Check if an executable is found on system PATH or standard user bin locations."""
+    if shutil.which(name) is not None:
+        return True
+    
+    # Check common fallback locations
+    home = Path.home()
+    fallbacks = [
+        home / ".local" / "bin" / name,
+        home / ".cargo" / "bin" / name,
+        Path("/usr/local/bin") / name,
+        Path("/usr/bin") / name,
+        home / "AppData" / "Local" / "Programs" / name,
+    ]
+    if platform.system().lower() == "windows":
+        fallbacks.extend([
+            home / ".local" / "bin" / f"{name}.exe",
+            home / ".local" / "bin" / f"{name}.cmd",
+            home / "AppData" / "Local" / "agy" / "bin" / f"{name}.exe",
+        ])
+    return any(p.exists() for p in fallbacks)
 
 
 def detect_installed_engines() -> List[str]:

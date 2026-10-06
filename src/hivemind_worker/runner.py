@@ -73,9 +73,27 @@ def _build_stripped_env(workspace_dir: Path) -> Dict[str, str]:
         "DEEPSEEK_API_KEY",
         "MISTRAL_API_KEY",
     ]
+    # Check current os.environ first
     for key in ai_keys:
         if key in os.environ:
             env[key] = os.environ[key]
+
+    # Also load from ~/.env if present and not already set
+    env_file = Path.home() / ".env"
+    if env_file.exists():
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("\"'")
+                    if k in ai_keys and k not in env:
+                        env[k] = v
+        except Exception:
+            pass
 
     # 3. Default Git Author / Committer config
     env["GIT_AUTHOR_NAME"] = os.environ.get("GIT_AUTHOR_NAME", "HiveMind Worker")
@@ -120,8 +138,8 @@ class TaskRunner:
                 return None
             # Update live log tail if running
             run_dir = self.workspace_root / run_id
-            agent_log = run_dir / "agent.log"
-            wrapper_log = run_dir / "wrapper.log"
+            agent_log = run_dir / ".hive" / "agent.log" if (run_dir / ".hive" / "agent.log").exists() else (run_dir / "agent.log")
+            wrapper_log = run_dir / ".hive" / "wrapper.log" if (run_dir / ".hive" / "wrapper.log").exists() else (run_dir / "wrapper.log")
             if st.status in ("starting", "running"):
                 st.log_tail = _safe_tail(agent_log) or _safe_tail(wrapper_log)
             return st
@@ -204,40 +222,30 @@ class TaskRunner:
 
     def _run_task_worker(self, req: DispatchRequest):
         """Main execution flow for a dispatched task."""
-        run_dir = Path(req.workspace_dir) if req.workspace_dir else (self.workspace_root / req.run_id)
-        run_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if req.workspace_dir:
+                base_ws = Path(req.workspace_dir).expanduser().resolve()
+                # If workspace_dir is a root folder, append run_id
+                run_dir = base_ws / req.run_id if not base_ws.name == req.run_id else base_ws
+            else:
+                run_dir = (self.workspace_root / req.run_id).resolve()
 
-        wrapper_log_path = run_dir / "wrapper.log"
-        agent_log_path = run_dir / "agent.log"
-        test_log_path = run_dir / "test.log"
-        prompt_file = run_dir / "prompt.txt"
+            run_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.error(f"[{req.run_id}] Failed to create workspace dir: {exc}")
+            with self._lock:
+                self._runs[req.run_id].status = "failed"
+                self._runs[req.run_id].error = f"Workspace creation error: {exc}"
+            self._persist_result(req.run_id)
+            return
 
-        def log_wrapper(msg: str):
-            logger.info(f"[{req.run_id}] {msg}")
-            with open(wrapper_log_path, "a", encoding="utf-8") as f:
-                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                f.write(f"[{ts}] {msg}\n")
-
-        log_wrapper(f"Starting task {req.run_id} (Engine: {req.agent_engine}, Strategy: {req.strategy})")
-
-        # 1. Format Prompt
-        full_prompt = (
-            f"{req.prompt.rstrip()}\n\n"
-            f"You are pursuing strategy {req.strategy_index} of {req.strategy_count}: {req.strategy}. "
-            "Take a distinct approach.\n"
-            "Change code only. Do not commit, push, or change git remotes.\n"
-        )
-        with open(prompt_file, "w", encoding="utf-8") as f:
-            f.write(full_prompt)
-
-        branch = req.branch or f"exp/worker-{req.strategy}"
         env = _build_stripped_env(run_dir)
+        branch = req.branch or f"exp/worker-{req.strategy}"
 
         try:
-            # 2. Git Setup / Clone
+            # 1. Git Setup / Clone
             git_dir = run_dir / ".git"
             if not git_dir.exists():
-                log_wrapper(f"Cloning repo {req.repo_url} into {run_dir}")
                 clone_res = subprocess.run(
                     ["git", "clone", req.repo_url, "."],
                     cwd=run_dir,
@@ -248,8 +256,33 @@ class TaskRunner:
                 if clone_res.returncode != 0:
                     raise RuntimeError(f"Git clone failed: {clone_res.stderr or clone_res.stdout}")
             else:
-                log_wrapper("Workspace already cloned. Fetching latest origin...")
                 subprocess.run(["git", "fetch", "origin"], cwd=run_dir, capture_output=True, env=env)
+
+            # 2. Setup run directory files
+            hive_meta_dir = run_dir / ".hive"
+            hive_meta_dir.mkdir(parents=True, exist_ok=True)
+            wrapper_log_path = hive_meta_dir / "wrapper.log"
+            agent_log_path = hive_meta_dir / "agent.log"
+            test_log_path = hive_meta_dir / "test.log"
+            prompt_file = hive_meta_dir / "prompt.txt"
+
+            def log_wrapper(msg: str):
+                logger.info(f"[{req.run_id}] {msg}")
+                with open(wrapper_log_path, "a", encoding="utf-8") as f:
+                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    f.write(f"[{ts}] {msg}\n")
+
+            log_wrapper(f"Starting task {req.run_id} (Engine: {req.agent_engine}, Strategy: {req.strategy})")
+
+            # 3. Format Prompt
+            full_prompt = (
+                f"{req.prompt.rstrip()}\n\n"
+                f"You are pursuing strategy {req.strategy_index} of {req.strategy_count}: {req.strategy}. "
+                "Take a distinct approach.\n"
+                "Change code only. Do not commit, push, or change git remotes.\n"
+            )
+            with open(prompt_file, "w", encoding="utf-8") as f:
+                f.write(full_prompt)
 
             # 3. Checkout target branch
             log_wrapper(f"Checking out branch {branch}...")
@@ -290,6 +323,23 @@ class TaskRunner:
             # Resolve binary path cross-platform (e.g. C:\...\claude.cmd or /usr/local/bin/claude)
             binary_name = agent_args[0]
             resolved_bin = shutil.which(binary_name)
+            if not resolved_bin:
+                home = Path.home()
+                candidates = [
+                    home / ".local" / "bin" / binary_name,
+                    home / ".cargo" / "bin" / binary_name,
+                    Path("/usr/local/bin") / binary_name,
+                    Path("/usr/bin") / binary_name,
+                    home / "AppData" / "Local" / "Programs" / binary_name,
+                    home / ".local" / "bin" / f"{binary_name}.exe",
+                    home / ".local" / "bin" / f"{binary_name}.cmd",
+                    home / "AppData" / "Local" / "agy" / "bin" / f"{binary_name}.exe",
+                ]
+                for cand in candidates:
+                    if cand.exists():
+                        resolved_bin = str(cand)
+                        break
+
             use_shell = False
             if resolved_bin:
                 agent_args[0] = resolved_bin
