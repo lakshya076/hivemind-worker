@@ -1,6 +1,6 @@
-import asyncio
 import datetime
 import json
+import logging
 import os
 import platform
 import shutil
@@ -13,6 +13,8 @@ import psutil
 
 from hivemind_worker.agent import build_agent_args
 from hivemind_worker.models import DispatchRequest, StatusResponse
+
+logger = logging.getLogger("hivemind_worker")
 
 
 def _safe_tail(file_path: Path, max_lines: int = 30) -> str:
@@ -211,6 +213,7 @@ class TaskRunner:
         prompt_file = run_dir / "prompt.txt"
 
         def log_wrapper(msg: str):
+            logger.info(f"[{req.run_id}] {msg}")
             with open(wrapper_log_path, "a", encoding="utf-8") as f:
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 f.write(f"[{ts}] {msg}\n")

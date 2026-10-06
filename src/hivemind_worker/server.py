@@ -1,8 +1,10 @@
+import logging
 import secrets
+import time
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from hivemind_worker import __version__
@@ -16,6 +18,14 @@ from hivemind_worker.models import (
 )
 from hivemind_worker.runner import TaskRunner
 from hivemind_worker.sysinfo import get_system_health
+
+# Configure logger for worker daemon
+logger = logging.getLogger("hivemind_worker")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 
 def create_app(config: Optional[WorkerConfig] = None) -> FastAPI:
@@ -38,17 +48,40 @@ def create_app(config: Optional[WorkerConfig] = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    # HTTP Request / Response logging middleware for journalctl visibility
+    @app.middleware("http")
+    async def request_logging_middleware(request: Request, call_next):
+        start_time = time.perf_counter()
+        client_ip = request.client.host if request.client else "unknown"
+        method = request.method
+        path = request.url.path
+
+        logger.info(f"--> [{client_ip}] {method} {path}")
+        try:
+            response: Response = await call_next(request)
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            status_code = response.status_code
+            
+            log_level = logger.info if status_code < 400 else (logger.warning if status_code < 500 else logger.error)
+            log_level(f"<-- [{client_ip}] {method} {path} -> {status_code} ({duration_ms:.1f}ms)")
+            return response
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            logger.error(f"<-- [{client_ip}] {method} {path} -> 500 Exception: {exc} ({duration_ms:.1f}ms)")
+            raise
+
     # Store in app state
     app.state.config = app_config
     app.state.runner = runner
 
-    def verify_auth(authorization: Optional[str] = Header(None)):
+    def verify_auth(request: Request, authorization: Optional[str] = Header(None)):
         fleet_key = app_config.fleet_key
+        client_ip = request.client.host if request.client else "unknown"
         if not fleet_key:
-            # If no key set on worker, pass through (open mode for local debugging)
             return
 
         if not authorization:
+            logger.warning(f"Unauthorized access from [{client_ip}]: Missing Authorization header on {request.url.path}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Missing Authorization header",
@@ -57,6 +90,7 @@ def create_app(config: Optional[WorkerConfig] = None) -> FastAPI:
 
         parts = authorization.split(" ")
         if len(parts) != 2 or parts[0].lower() != "bearer":
+            logger.warning(f"Unauthorized access from [{client_ip}]: Malformed Authorization header")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid Authorization scheme. Use 'Bearer <key>'",
@@ -65,6 +99,7 @@ def create_app(config: Optional[WorkerConfig] = None) -> FastAPI:
 
         token = parts[1]
         if not secrets.compare_digest(token, fleet_key):
+            logger.warning(f"Unauthorized access from [{client_ip}]: Invalid fleet API key supplied")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid fleet API key",
