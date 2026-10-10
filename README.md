@@ -18,14 +18,46 @@ pip install hivemind-worker
 ### 2. Run Worker Daemon
 
 ```bash
-# Start the daemon with FLEET key
-hivemind-worker start --key <YOUR_FLEET_KEY> --port 7422
+# Store the fleet key from the master's `hive keygen` (prompted, hidden input)
+hivemind-worker key set
+
+# Start the daemon
+hivemind-worker start
 ```
 
+If no key is configured, `start` generates one, saves it to the worker config, and tells you how to install it on the master. A fleet key is **always** required; the daemon never runs unauthenticated on the network.
+
 By default:
-- Listens on `0.0.0.0:7422` (accessible via Tailscale mesh IP `100.x.x.x` or local network)
+- Listens on `0.0.0.0:7422` (reachable via Tailscale `100.x.x.x`, MagicDNS, or the local network)
+- Accepts connections only from private networks: loopback, LAN (`10/8`, `172.16/12`, `192.168/16`, IPv6 ULA/link-local) and Tailscale (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`). Public internet addresses get `403`.
 - Workspace root defaults to `~/hive-workspace` (or `C:\Users\<user>\hive-workspace` on Windows)
 - Authenticates all requests with `Authorization: Bearer <fleet-key>`
+
+### Key management
+
+| Command | Purpose |
+|---|---|
+| `hivemind-worker key set` | Store a fleet key (hidden prompt; keeps it out of shell history and process lists) |
+| `hivemind-worker key show` | Print the configured key |
+| `hivemind-worker key rotate` | Replace the key with a new random one |
+
+### Local testing without a key
+
+```bash
+hivemind-worker start --insecure-no-auth
+```
+Binds to `127.0.0.1` and serves loopback clients only, whatever `--host` says.
+
+### Configuration file
+
+Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macOS). Point at another file with `--config <path>` or `HIVEMIND_WORKER_CONFIG`. If the file exists but cannot be read, the daemon refuses to start rather than falling back to defaults.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `fleet_key` | generated on first start | Shared key the master must present |
+| `host` / `port` | `0.0.0.0` / `7422` | Bind address |
+| `allowed_networks` | private + Tailscale ranges | Source CIDRs allowed to connect. E.g. `["100.64.0.0/10"]` for a Tailscale-only worker |
+| `allowed_hosts` | `[]` | Extra DNS names the master may use to reach this worker (see below) |
 
 ---
 
@@ -43,7 +75,10 @@ By default:
 
 ## 🛡️ Security Features
 
-- **Fleet API Key Authentication**: Rejects unauthenticated requests with HTTP 401.
+- **Mandatory Fleet API Key Authentication**: Rejects unauthenticated requests with HTTP 401. The daemon refuses to run without a key (except `--insecure-no-auth`, which is loopback-only).
+- **Private-Network Allowlist**: Requests from addresses outside `allowed_networks` are rejected with 403 before authentication, so a worker accidentally exposed to the internet (cloud VM, port forward) is not reachable.
+- **Browser Request Blocking**: No CORS is served, and any request carrying `Origin` or a cross-site `Sec-Fetch-Site` header is rejected with 403. Web pages cannot drive the worker.
+- **DNS-Rebinding Protection**: The `Host` header must be an IP address, `localhost`, this machine's hostname, its Tailscale MagicDNS name, or an entry in `allowed_hosts`; anything else gets 400.
 - **Workspace Isolation**: Git operations and file edits are strictly scoped to the assigned task directory.
 - **Stripped Subprocess Environment**: Subprocesses receive only essential execution variables (`PATH`, git user config, target API keys) — no host SSH keys or personal credentials.
 
@@ -53,9 +88,9 @@ By default:
 
 ### Linux (systemd service)
 
-1. Save configuration once on the worker:
+1. Save configuration once on the worker (as the same user the service will run as):
    ```bash
-   hivemind-worker start --key <FLEET_KEY> --port 7422 --save
+   hivemind-worker key set
    ```
 
 2. Create `/etc/systemd/system/hivemind-worker.service`:
@@ -68,7 +103,7 @@ By default:
    Type=simple
    User=<username>
    Environment="PATH=/home/<username>/.local/bin:/usr/local/bin:/usr/bin:/bin"
-   ExecStart=/home/<username/.local/bin/hivemind-worker start
+   ExecStart=/home/<username>/.local/bin/hivemind-worker start
    Restart=always
    RestartSec=5
 
@@ -124,7 +159,7 @@ If you only want to run the worker in the background during your current session
 Run in PowerShell as Administrator:
 ```powershell
 # Save settings first
-hivemind-worker start --key <FLEET_KEY> --port 7422 --save
+hivemind-worker key set
 
 # Register auto-start task on logon
 $Action = New-ScheduledTaskAction -Execute "hivemind-worker.exe" -Argument "start"
@@ -134,12 +169,27 @@ Register-ScheduledTask -TaskName "HiveMindWorker" -Action $Action -Trigger $Trig
 ```
 
 ##### Option B: Windows Service via NSSM (Runs even when logged out)
+
+> [!WARNING]
+> NSSM services run as **LocalSystem** unless you set `ObjectName`. LocalSystem has a different home folder, so it would not find your worker config, API keys (`~/.env`) or git credentials, and any job would run with full SYSTEM privileges. Always run the service as your own (or a dedicated) user and pass `--config` explicitly.
+
 ```powershell
+hivemind-worker key set   # run as the account the service will use
+
 $WorkerPath = (Get-Command hivemind-worker).Source
-nssm install HiveMindWorker $WorkerPath "start"
+$Config = "$env:USERPROFILE\.hivemind\worker.json"
+nssm install HiveMindWorker $WorkerPath "--config `"$Config`" start"
+nssm set HiveMindWorker ObjectName ".\$env:USERNAME" "<your-windows-password>"
 nssm set HiveMindWorker AppStdout "$env:USERPROFILE\.hivemind\worker-service.log"
 nssm set HiveMindWorker AppStderr "$env:USERPROFILE\.hivemind\worker-service.log"
 nssm start HiveMindWorker
 ```
+*(For a Microsoft account, use `MicrosoftAccount\you@example.com` as the user name.)*
+
+---
+
+### Reaching the worker by name
+
+The master normally connects by IP (LAN or Tailscale `100.x`), which always works. Connecting by name also works for `localhost`, the machine's hostname (and `<hostname>.local`), and its Tailscale MagicDNS name (picked up automatically, even if Tailscale starts after the worker). For any other DNS name, add it to `allowed_hosts` in the worker config.
 
 

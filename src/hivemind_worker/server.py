@@ -5,10 +5,17 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from hivemind_worker import __version__
-from hivemind_worker.config import WorkerConfig
+from hivemind_worker.config import LOOPBACK_NETWORKS, WorkerConfig
+from hivemind_worker.security import (
+    HostAllowlist,
+    client_ip_allowed,
+    is_browser_request,
+    parse_networks,
+)
 from hivemind_worker.models import (
     CancelResponse,
     DispatchRequest,
@@ -28,11 +35,31 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 
-def create_app(config: Optional[WorkerConfig] = None) -> FastAPI:
-    """Factory function to build configured FastAPI application instance."""
+def create_app(
+    config: Optional[WorkerConfig] = None,
+    *,
+    insecure_no_auth: bool = False,
+    host_allowlist: Optional[HostAllowlist] = None,
+) -> FastAPI:
+    """Factory function to build configured FastAPI application instance.
+
+    Fails closed: without a fleet key the app refuses to build unless
+    ``insecure_no_auth`` is set, in which case only loopback clients are served.
+    """
     app_config = config or WorkerConfig.load()
+    if not app_config.fleet_key and not insecure_no_auth:
+        raise ValueError(
+            "Refusing to start without a fleet key. Configure one, or pass "
+            "insecure_no_auth=True for a loopback-only test daemon."
+        )
+
     workspace_root = Path(app_config.workspace_root)
     runner = TaskRunner(workspace_root)
+
+    allowed_networks = parse_networks(
+        LOOPBACK_NETWORKS if insecure_no_auth else app_config.allowed_networks
+    )
+    hosts = host_allowlist or HostAllowlist(app_config.allowed_hosts)
 
     app = FastAPI(
         title="HiveMind Worker Daemon",
@@ -40,13 +67,31 @@ def create_app(config: Optional[WorkerConfig] = None) -> FastAPI:
         version=__version__,
     )
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # Network guards run before routing and authentication. No CORS middleware
+    # is installed: no browser client exists, so browsers get no CORS grants.
+    @app.middleware("http")
+    async def network_guard_middleware(request: Request, call_next):
+        client_ip = request.client.host if request.client else None
+        if not client_ip_allowed(client_ip, allowed_networks):
+            logger.warning(f"Rejected [{client_ip}]: source address not in allowed_networks")
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "Source address not allowed"},
+            )
+        if is_browser_request(request.headers):
+            logger.warning(f"Rejected [{client_ip}]: browser-originated request ({request.headers.get('origin')})")
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "Browser-originated requests are not allowed"},
+            )
+        host_header = request.headers.get("host")
+        if not await run_in_threadpool(hosts.is_allowed, host_header):
+            logger.warning(f"Rejected [{client_ip}]: unrecognised Host header {host_header!r}")
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": "Unrecognised Host header"},
+            )
+        return await call_next(request)
 
     # HTTP Request / Response logging middleware for journalctl visibility
     @app.middleware("http")
@@ -77,8 +122,15 @@ def create_app(config: Optional[WorkerConfig] = None) -> FastAPI:
     def verify_auth(request: Request, authorization: Optional[str] = Header(None)):
         fleet_key = app_config.fleet_key
         client_ip = request.client.host if request.client else "unknown"
-        if not fleet_key:
+        if insecure_no_auth:
+            # Loopback-only test mode: the network guard already rejected
+            # every non-loopback client.
             return
+        if not fleet_key:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Worker has no fleet key configured",
+            )
 
         if not authorization:
             logger.warning(f"Unauthorized access from [{client_ip}]: Missing Authorization header on {request.url.path}")
