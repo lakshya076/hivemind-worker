@@ -25,11 +25,38 @@ from hivemind_worker.models import (
 logger = logging.getLogger("hivemind_worker")
 
 
-def _safe_tail(file_path: Path, max_lines: int = 30, max_bytes: int = 65536) -> str:
-    """Read the last N lines of a log file without loading the entire file into memory."""
-    if not file_path.exists():
-        return ""
+def _is_link_or_junction(path: Path) -> bool:
+    """Return True if path is a symbolic link or Windows NTFS directory junction."""
     try:
+        if path.is_symlink():
+            return True
+        is_junc = getattr(path, "is_junction", None)
+        if callable(is_junc) and is_junc():
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _safe_tail(
+    file_path: Path,
+    max_lines: int = 30,
+    max_bytes: int = 65536,
+    *,
+    root_dir: Optional[Path] = None,
+) -> str:
+    """Read the last N lines of a log file without loading the entire file into memory.
+    Refuses symlinks, NTFS junctions, hardlinks, and paths escaping root_dir."""
+    try:
+        if _is_link_or_junction(file_path) or _is_link_or_junction(file_path.parent):
+            return ""
+        if not file_path.exists() or not file_path.is_file():
+            return ""
+        if root_dir is not None and not file_path.resolve().is_relative_to(root_dir.resolve()):
+            return ""
+        st = file_path.stat()
+        if st.st_nlink > 1:
+            return ""
         with open(file_path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
@@ -448,7 +475,8 @@ class TaskRunner:
 
     @staticmethod
     def _remove_entry_readonly_safe(target: Path) -> None:
-        """Delete a file or directory tree, clearing read-only attributes (e.g. .git/objects/pack) if needed."""
+        """Delete a file or directory tree, clearing read-only attributes (e.g. .git/objects/pack) if needed.
+        Never traverses symbolic links or Windows NTFS directory junctions."""
         def _onerror(func, path, _exc_info):
             try:
                 os.chmod(path, stat.S_IWRITE)
@@ -456,7 +484,17 @@ class TaskRunner:
             except Exception:
                 pass
 
-        if target.is_dir() and not target.is_symlink():
+        if _is_link_or_junction(target):
+            try:
+                target.unlink()
+            except OSError:
+                try:
+                    os.rmdir(target)
+                except Exception:
+                    pass
+            return
+
+        if target.is_dir():
             shutil.rmtree(target, onerror=_onerror)
         else:
             try:
@@ -560,11 +598,17 @@ class TaskRunner:
             existing_items = list(run_dir.iterdir())
             saved_files: Dict[str, bytes] = {}
             for item in existing_items:
-                if item.is_file():
-                    saved_files[item.name] = item.read_bytes()
-                    item.unlink()
+                if _is_link_or_junction(item):
+                    self._remove_entry_readonly_safe(item)
+                elif item.is_file():
+                    try:
+                        if item.name == "result.json" and item.stat().st_nlink == 1:
+                            saved_files[item.name] = item.read_bytes()
+                    except Exception:
+                        pass
+                    self._remove_entry_readonly_safe(item)
                 elif item.is_dir():
-                    shutil.rmtree(item, ignore_errors=True)
+                    self._remove_entry_readonly_safe(item)
 
             try:
                 if mirror_dir is not None:
@@ -659,6 +703,8 @@ class TaskRunner:
         """Spawn a subprocess tracked in _active_procs with timeout and cancellation support."""
         stdin_fh = open(stdin_file, "rb") if stdin_file is not None else None
         try:
+            if _is_link_or_junction(stdout_path) or stdout_path.exists():
+                self._remove_entry_readonly_safe(stdout_path)
             with open(stdout_path, "w", encoding="utf-8") as out_fh:
                 proc = subprocess.Popen(
                     args,

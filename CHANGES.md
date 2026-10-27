@@ -168,3 +168,10 @@ Every change on this branch, one point each. Master-side changes are in the Hive
 99. `_build_stripped_env()` (`runner.py`) adds an `include_ai_keys` parameter (`True` by default for backward compatibility).
 100. `TaskRunner._run_task_worker()` passes AI provider API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`) only to the AI agent subprocess and omits them from `git`, `test_command`, and `bench_command` subprocesses so agent-modified tests or benchmarks cannot exfiltrate API keys into logs or commits.
 101. Added `test_v2_ai_api_keys_are_passed_to_agent_but_never_leaked_to_test_or_bench_commands` in `tests/test_runner_accuracy_perf.py`.
+
+### V3: Symlink, hardlink, and Windows NTFS junction confinement
+102. New `_is_link_or_junction()` (`runner.py`) detects both symbolic links and Windows NTFS directory junctions (`Path.is_junction()`).
+103. `_safe_tail()` (`runner.py`) refuses symbolic links, NTFS junctions, hardlinked files (`st_nlink > 1`), and paths resolving outside `root_dir`, preventing a malicious test or agent from linking `.hive/test.log` or `.hive/agent.log` to host secrets such as `~/.hivemind/worker.json` or `~/.env`.
+104. `TaskRunner._remove_entry_readonly_safe()` unlinks symbolic links and removes NTFS directory junctions (`os.rmdir`) without calling `shutil.rmtree()`, preventing recursive deletion of junction targets outside `workspace_root`.
+105. `TaskRunner._prepare_git_workspace()` and `_run_managed_proc()` remove pre-existing links/junctions before reading `result.json` or opening log files for writing.
+106. Added 2 tests for V3 in `tests/test_runner_accuracy_perf.py`.
