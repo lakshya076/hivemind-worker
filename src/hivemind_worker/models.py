@@ -1,5 +1,20 @@
+import re
 from typing import Any, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def validate_run_id(value: str) -> str:
+    """Ensure run_id is a single safe directory name with no path traversal."""
+    if not isinstance(value, str):
+        raise ValueError("run_id must be a string")
+    cleaned = value.strip()
+    if not cleaned or ".." in cleaned or not _RUN_ID_RE.match(cleaned):
+        raise ValueError(
+            f"Invalid run_id {value!r}: must be 1-128 characters of [A-Za-z0-9._-] and cannot contain '..'"
+        )
+    return cleaned
 
 
 class DispatchRequest(BaseModel):
@@ -15,7 +30,15 @@ class DispatchRequest(BaseModel):
     model: Optional[str] = Field(default=None, description="Optional model override")
     test_command: Optional[str] = Field(default=None, description="Verification test command (e.g. 'pytest -q')")
     bench_command: Optional[str] = Field(default=None, description="Benchmark command producing JSON metrics")
-    workspace_dir: Optional[str] = Field(default=None, description="Optional workspace directory override")
+    workspace_dir: Optional[str] = Field(
+        default=None,
+        description="Deprecated/ignored client hint; runs are always confined to the worker's workspace_root",
+    )
+
+    @field_validator("run_id")
+    @classmethod
+    def _check_run_id(cls, value: str) -> str:
+        return validate_run_id(value)
 
 
 class DispatchResponse(BaseModel):

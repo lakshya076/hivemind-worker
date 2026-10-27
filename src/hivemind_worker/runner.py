@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 import psutil
 
 from hivemind_worker.agent import build_agent_command
-from hivemind_worker.models import DispatchRequest, StatusResponse
+from hivemind_worker.models import DispatchRequest, StatusResponse, validate_run_id
 
 logger = logging.getLogger("hivemind_worker")
 
@@ -251,6 +251,15 @@ class TaskRunner:
         self._mirror_locks: Dict[str, threading.Lock] = {}
         self._load_persisted_runs()
 
+    def _run_dir_for(self, run_id: str) -> Path:
+        """Return the confined workspace directory for run_id inside self.workspace_root."""
+        clean_id = validate_run_id(run_id)
+        root = self.workspace_root.expanduser().resolve()
+        target = (root / clean_id).resolve()
+        if target.parent != root or not target.is_relative_to(root):
+            raise ValueError(f"Refusing run_id {run_id!r} outside workspace_root")
+        return target
+
     def _get_mirror_lock(self, key: str) -> threading.Lock:
         with self._mirror_locks_guard:
             lock = self._mirror_locks.get(key)
@@ -285,11 +294,14 @@ class TaskRunner:
                     pass
 
     def get_run_status(self, run_id: str) -> Optional[StatusResponse]:
+        try:
+            run_dir = self._run_dir_for(run_id)
+        except ValueError:
+            return None
         with self._lock:
             st = self._runs.get(run_id)
             if not st:
                 return None
-            run_dir = self.workspace_root / run_id
             agent_log = run_dir / ".hive" / "agent.log" if (run_dir / ".hive" / "agent.log").exists() else (run_dir / "agent.log")
             wrapper_log = run_dir / ".hive" / "wrapper.log" if (run_dir / ".hive" / "wrapper.log").exists() else (run_dir / "wrapper.log")
             if st.status in ("starting", "running"):
@@ -314,6 +326,10 @@ class TaskRunner:
 
     def cancel_run(self, run_id: str) -> bool:
         """Cancel a running task, stop its runner thread, and terminate its process tree."""
+        try:
+            validate_run_id(run_id)
+        except ValueError:
+            return False
         with self._lock:
             st = self._runs.get(run_id)
             proc = self._active_procs.pop(run_id, None)
@@ -334,6 +350,7 @@ class TaskRunner:
 
     def dispatch(self, req: DispatchRequest) -> StatusResponse:
         """Initialize and start a dispatch run in a background thread."""
+        self._run_dir_for(req.run_id)
         with self._lock:
             if req.run_id in self._runs and self._runs[req.run_id].status in ("starting", "running"):
                 return self._runs[req.run_id]
@@ -362,7 +379,10 @@ class TaskRunner:
         st = self._runs.get(run_id)
         if not st:
             return
-        run_dir = self.workspace_root / run_id
+        try:
+            run_dir = self._run_dir_for(run_id)
+        except ValueError:
+            return
         run_dir.mkdir(parents=True, exist_ok=True)
         res_file = run_dir / "result.json"
         try:
@@ -555,12 +575,7 @@ class TaskRunner:
     def _run_task_worker(self, req: DispatchRequest):
         """Main execution flow for a dispatched task."""
         try:
-            if req.workspace_dir:
-                base_ws = Path(req.workspace_dir).expanduser().resolve()
-                run_dir = base_ws / req.run_id if base_ws.name != req.run_id else base_ws
-            else:
-                run_dir = (self.workspace_root / req.run_id).resolve()
-
+            run_dir = self._run_dir_for(req.run_id)
             run_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             logger.error(f"[{req.run_id}] Failed to create workspace dir: {exc}")

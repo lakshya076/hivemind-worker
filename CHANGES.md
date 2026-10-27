@@ -119,3 +119,14 @@ Every change on this branch, one point each. Master-side changes are in the Hive
 ### Testing (local, not committed)
 75. Added 11 tests in `tests/test_runner_accuracy_perf.py` covering multiline prompt delivery with special characters over `.cmd` shims, `--permission-mode acceptEdits`, `--model` forwarding and validation, `"no_changes"` status, failed `git push` handling, process-tree termination on cancel and timeout, `.git/info/exclude` preservation of `.gitignore`, test failure log surfacing, stale run recovery on restart, cached git mirrors, and `_safe_tail`.
 76. Total worker suite: 92 passed, 3 skipped.
+
+---
+
+## Round 4: remaining high-severity security fixes
+
+### S1: Path traversal via `run_id` and `workspace_dir` confinement
+77. New `validate_run_id()` (`models.py`) enforces `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` and forbids `..`, rejecting traversal strings, slashes, drive letters, and leading dashes.
+78. `DispatchRequest` validates `run_id` on ingress so `POST /dispatch` rejects traversal IDs with HTTP 422 before reaching the runner.
+79. New `TaskRunner._run_dir_for()` (`runner.py`) resolves `<workspace_root>/<run_id>` and verifies `target.parent == workspace_root` and `target.is_relative_to(workspace_root)`.
+80. Client-supplied `workspace_dir` in `DispatchRequest` is ignored by the worker (`_run_task_worker`, `get_run_status`, `_persist_result` all use `_run_dir_for`), so a caller cannot direct the worker to unlink or overwrite files outside `workspace_root`.
+81. Added 14 tests for S1 in `tests/test_runner_accuracy_perf.py`.
