@@ -175,3 +175,12 @@ Every change on this branch, one point each. Master-side changes are in the Hive
 104. `TaskRunner._remove_entry_readonly_safe()` unlinks symbolic links and removes NTFS directory junctions (`os.rmdir`) without calling `shutil.rmtree()`, preventing recursive deletion of junction targets outside `workspace_root`.
 105. `TaskRunner._prepare_git_workspace()` and `_run_managed_proc()` remove pre-existing links/junctions before reading `result.json` or opening log files for writing.
 106. Added 2 tests for V3 in `tests/test_runner_accuracy_perf.py`.
+
+---
+
+## Round 7: deep security audit fixes (Medium severity)
+
+### V5: Managed `bench_command` execution with cancellation and process-tree timeout cleanup
+107. `TaskRunner._run_task_worker()` (`runner.py`) executes `bench_command` through `_run_managed_proc()` (logging output to `.hive/bench.log`) instead of raw `subprocess.run()`, so `DELETE /cancel/<run_id>` can terminate an active benchmark and a timed-out benchmark kills its entire child process tree via `_kill_proc_tree()`.
+108. Benchmark timeouts mark the run `"failed"` with a clear timeout message and surface the tail of `.hive/bench.log` in `log_tail`.
+109. Added `test_v5_bench_command_timeout_kills_process_tree_and_marks_failed` in `tests/test_runner_accuracy_perf.py`.

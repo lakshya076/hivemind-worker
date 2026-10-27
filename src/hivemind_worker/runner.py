@@ -761,6 +761,7 @@ class TaskRunner:
         wrapper_log_path = hive_meta_dir / "wrapper.log"
         agent_log_path = hive_meta_dir / "agent.log"
         test_log_path = hive_meta_dir / "test.log"
+        bench_log_path = hive_meta_dir / "bench.log"
         prompt_file = hive_meta_dir / "prompt.txt"
 
         def log_wrapper(msg: str):
@@ -905,22 +906,39 @@ class TaskRunner:
                 if self._is_cancelled(req.run_id):
                     return
                 log_wrapper(f"Running bench command: {req.bench_command}")
-                b_proc = subprocess.run(
-                    req.bench_command,
-                    cwd=run_dir,
-                    shell=True,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.test_timeout,
-                )
+                try:
+                    bench_exit = self._run_managed_proc(
+                        req.run_id,
+                        req.bench_command,
+                        cwd=run_dir,
+                        env=env,
+                        shell=True,
+                        stdin_file=None,
+                        stdout_path=bench_log_path,
+                        timeout=self.test_timeout,
+                    )
+                except subprocess.TimeoutExpired:
+                    log_wrapper(f"Benchmark command timed out after {int(self.test_timeout)}s")
+                    with self._lock:
+                        if req.run_id not in self._cancelled:
+                            self._runs[req.run_id].status = "failed"
+                            self._runs[req.run_id].error = f"Benchmark command timed out after {int(self.test_timeout)}s"
+                            self._runs[req.run_id].log_tail = _safe_tail(bench_log_path) or _safe_tail(agent_log_path)
+                            self._runs[req.run_id].finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    return
+
                 if self._is_cancelled(req.run_id):
                     return
-                bench_exit = b_proc.returncode
+                raw_bench = ""
                 try:
-                    bench_data = json.loads(b_proc.stdout)
+                    if not _is_link_or_junction(bench_log_path) and bench_log_path.is_file():
+                        raw_bench = bench_log_path.read_text(encoding="utf-8", errors="replace")
                 except Exception:
-                    bench_data = {"raw_output": b_proc.stdout.strip()}
+                    raw_bench = ""
+                try:
+                    bench_data = json.loads(raw_bench)
+                except Exception:
+                    bench_data = {"raw_output": raw_bench.strip()}
                 with self._lock:
                     self._runs[req.run_id].bench_exit_code = bench_exit
                     self._runs[req.run_id].benchmark_data = bench_data
