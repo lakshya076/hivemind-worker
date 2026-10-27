@@ -13,7 +13,13 @@ from typing import Dict, List, Optional
 import psutil
 
 from hivemind_worker.agent import build_agent_command
-from hivemind_worker.models import DispatchRequest, StatusResponse, validate_run_id
+from hivemind_worker.models import (
+    DispatchRequest,
+    StatusResponse,
+    validate_branch_name,
+    validate_repo_url,
+    validate_run_id,
+)
 
 logger = logging.getLogger("hivemind_worker")
 
@@ -351,6 +357,8 @@ class TaskRunner:
     def dispatch(self, req: DispatchRequest) -> StatusResponse:
         """Initialize and start a dispatch run in a background thread."""
         self._run_dir_for(req.run_id)
+        validate_repo_url(req.repo_url)
+        validate_branch_name(req.branch)
         with self._lock:
             if req.run_id in self._runs and self._runs[req.run_id].status in ("starting", "running"):
                 return self._runs[req.run_id]
@@ -393,7 +401,8 @@ class TaskRunner:
 
     def _ensure_mirror(self, repo_url: str, env: Dict[str, str]) -> Optional[Path]:
         """Create or update a local bare mirror for repo_url so clones stay local and fast."""
-        digest = hashlib.sha256(repo_url.strip().encode("utf-8")).hexdigest()[:16]
+        repo_url = validate_repo_url(repo_url)
+        digest = hashlib.sha256(repo_url.encode("utf-8")).hexdigest()[:16]
         mirror_dir = self.mirrors_root / f"{digest}.git"
         lock = self._get_mirror_lock(digest)
 
@@ -404,7 +413,7 @@ class TaskRunner:
                     if mirror_dir.exists():
                         shutil.rmtree(mirror_dir, ignore_errors=True)
                     res = subprocess.run(
-                        ["git", "clone", "--bare", repo_url, str(mirror_dir)],
+                        ["git", "clone", "--bare", "--", repo_url, str(mirror_dir)],
                         capture_output=True,
                         text=True,
                         env=env,
@@ -434,9 +443,11 @@ class TaskRunner:
         log_wrapper,
     ) -> Optional[str]:
         """Clone or update the repository using the local bare mirror cache and checkout the target branch."""
+        repo_url = validate_repo_url(req.repo_url)
+        branch = validate_branch_name(branch) or f"exp/{req.run_id[:12]}-worker"
         git_dir = run_dir / ".git"
         if not git_dir.exists():
-            mirror_dir = self._ensure_mirror(req.repo_url, env)
+            mirror_dir = self._ensure_mirror(repo_url, env)
             # Clear any non-git metadata files before git clone into run_dir
             existing_items = list(run_dir.iterdir())
             saved_files: Dict[str, bytes] = {}
@@ -450,7 +461,7 @@ class TaskRunner:
             try:
                 if mirror_dir is not None:
                     clone_res = subprocess.run(
-                        ["git", "clone", str(mirror_dir), "."],
+                        ["git", "clone", "--", str(mirror_dir), "."],
                         cwd=run_dir,
                         capture_output=True,
                         text=True,
@@ -458,7 +469,7 @@ class TaskRunner:
                     )
                     if clone_res.returncode == 0:
                         subprocess.run(
-                            ["git", "remote", "set-url", "origin", req.repo_url],
+                            ["git", "remote", "set-url", "origin", "--", repo_url],
                             cwd=run_dir,
                             capture_output=True,
                             text=True,
@@ -466,7 +477,7 @@ class TaskRunner:
                         )
                 else:
                     clone_res = subprocess.run(
-                        ["git", "clone", req.repo_url, "."],
+                        ["git", "clone", "--", repo_url, "."],
                         cwd=run_dir,
                         capture_output=True,
                         text=True,
@@ -481,7 +492,7 @@ class TaskRunner:
                         target.write_bytes(content)
         else:
             subprocess.run(
-                ["git", "remote", "set-url", "origin", req.repo_url],
+                ["git", "remote", "set-url", "origin", "--", repo_url],
                 cwd=run_dir,
                 capture_output=True,
                 env=env,
@@ -785,7 +796,7 @@ class TaskRunner:
             if has_changes:
                 log_wrapper(f"Pushing branch {branch} to origin...")
                 push_res = subprocess.run(
-                    ["git", "push", "-u", "origin", branch, "--force"],
+                    ["git", "push", "-u", "--force", "origin", "--", branch],
                     cwd=run_dir,
                     capture_output=True,
                     text=True,

@@ -130,3 +130,10 @@ Every change on this branch, one point each. Master-side changes are in the Hive
 79. New `TaskRunner._run_dir_for()` (`runner.py`) resolves `<workspace_root>/<run_id>` and verifies `target.parent == workspace_root` and `target.is_relative_to(workspace_root)`.
 80. Client-supplied `workspace_dir` in `DispatchRequest` is ignored by the worker (`_run_task_worker`, `get_run_status`, `_persist_result` all use `_run_dir_for`), so a caller cannot direct the worker to unlink or overwrite files outside `workspace_root`.
 81. Added 14 tests for S1 in `tests/test_runner_accuracy_perf.py`.
+
+### S2: Git option and remote-helper injection via `repo_url` and `branch`
+82. New `validate_repo_url()` (`models.py`) rejects `repo_url` values starting with `-` (e.g. `--upload-pack=...`), using git remote helper protocols (`ext::`, `fd::`), or containing whitespace/control characters.
+83. New `validate_branch_name()` (`models.py`) enforces `^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$` and rejects leading dashes, `..`, `//`, `@{`, and `.lock` suffixes.
+84. `DispatchRequest` validates `repo_url` and `branch` on ingress (HTTP 422 on invalid values), and `TaskRunner` re-validates both before executing git commands.
+85. `git clone`, `git remote set-url`, and `git push` invocations in `runner.py` pass `--` before positional URL/branch arguments.
+86. Added 16 tests for S2 in `tests/test_runner_accuracy_perf.py` (total worker suite: 122 passed, 3 skipped).

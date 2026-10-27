@@ -3,6 +3,8 @@ from typing import Any, List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
+_FORBIDDEN_URL_PREFIXES = ("ext::", "fd::")
 
 
 def validate_run_id(value: str) -> str:
@@ -14,6 +16,44 @@ def validate_run_id(value: str) -> str:
         raise ValueError(
             f"Invalid run_id {value!r}: must be 1-128 characters of [A-Za-z0-9._-] and cannot contain '..'"
         )
+    return cleaned
+
+
+def validate_repo_url(value: str) -> str:
+    """Reject git option injection (-o, --upload-pack), remote helper protocols (ext::), and control chars."""
+    if not isinstance(value, str):
+        raise ValueError("repo_url must be a string")
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("repo_url cannot be empty")
+    if cleaned.startswith("-"):
+        raise ValueError(f"Invalid repo_url {value!r}: cannot start with '-'")
+    lower = cleaned.lower()
+    if lower.startswith(_FORBIDDEN_URL_PREFIXES) or "::" in lower.split("://", 1)[0]:
+        raise ValueError(f"Invalid repo_url {value!r}: forbidden git remote helper protocol")
+    if any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in cleaned):
+        raise ValueError(f"Invalid repo_url {value!r}: whitespace and control characters are not allowed")
+    return cleaned
+
+
+def validate_branch_name(value: Optional[str]) -> Optional[str]:
+    """Ensure branch name cannot be interpreted as a git flag or invalid ref."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("branch must be a string")
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if (
+        cleaned.startswith("-")
+        or cleaned.endswith(("/", ".lock", "."))
+        or ".." in cleaned
+        or "//" in cleaned
+        or "@{" in cleaned
+        or not _BRANCH_RE.match(cleaned)
+    ):
+        raise ValueError(f"Invalid branch name {value!r}")
     return cleaned
 
 
@@ -39,6 +79,16 @@ class DispatchRequest(BaseModel):
     @classmethod
     def _check_run_id(cls, value: str) -> str:
         return validate_run_id(value)
+
+    @field_validator("repo_url")
+    @classmethod
+    def _check_repo_url(cls, value: str) -> str:
+        return validate_repo_url(value)
+
+    @field_validator("branch")
+    @classmethod
+    def _check_branch(cls, value: Optional[str]) -> Optional[str]:
+        return validate_branch_name(value)
 
 
 class DispatchResponse(BaseModel):
