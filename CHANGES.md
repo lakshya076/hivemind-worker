@@ -85,3 +85,37 @@ Every change on this branch, one point each. Master-side changes are in the Hive
 52. A real uvicorn server on a socket is driven with `httpx`, the master's client library.
 53. The real `hivemind-worker` executable is run as a background process with redirected output and probed over loopback, LAN IP, Tailscale IP and MagicDNS name.
 54. Mutation-checked: re-introducing each original bug (fail-open auth, keyless `verify_auth`, no browser check, any Host, any source IP, corrupt config ignored) makes the suite fail.
+
+---
+
+## Round 3: high-impact accuracy and performance upgrades
+
+### Prompt delivery and agent execution (A1, A2, A3, security #7)
+55. Replaced `build_agent_args` with `build_agent_command` returning an `AgentCommand` dataclass (`agent.py`).
+56. Aider receives the prompt via `--message-file <prompt_file>` instead of `--message <prompt>` on the command line, preserving multiline prompts and avoiding command-line length limits.
+57. Claude Code receives the prompt over `stdin` (`stdin_file`) instead of `-p <prompt>` on the command line, so multiline prompts and special characters arrive intact on Windows `.cmd` installs.
+58. Claude Code is launched with `--permission-mode acceptEdits` so headless runs can edit files without allowing arbitrary shell commands.
+59. `hive dispatch --model` is now passed through to Claude Code (`--model <model>`).
+60. New `validate_model()` validates model names against a strict allowlist regex (`^[A-Za-z0-9._:/@+\-]{1,200}$`) so a model string can never inject flags or shell metacharacters.
+61. The runner never launches agents with `shell=True` (`runner.py`).
+62. On Windows, `.cmd` / `.bat` shims are invoked via `[COMSPEC, "/d", "/s", "/c", resolved_bin, ...]` with `shell=False` when the prompt is in a file/stdin, and refused if `prompt_in_args` is set (`agy`).
+
+### Accurate run status and git hygiene (A4, A5, A6, A7, A8, A9, A14)
+63. `StatusResponse` (`models.py`) adds `"no_changes"` to `status`, plus `pushed: Optional[bool]` and `commit: Optional[str]`.
+64. When an agent finishes with exit code 0 and passing tests but makes no file changes, the run is marked `"no_changes"` with `pushed = False` instead of `"succeeded"`.
+65. When `git push` fails, the run is marked `"failed"` with `pushed = False` and the git error message instead of logging a warning and reporting `"succeeded"`.
+66. When `git push` succeeds, `pushed = True` and `commit` stores the pushed commit SHA.
+67. `cancel_run()` records the run ID in `_cancelled`, terminates the entire agent/test process tree via `_kill_proc_tree()`, and stops the background worker thread before tests, commit, or push can run or overwrite `"cancelled"`.
+68. When an agent or test command exceeds its timeout, `_kill_proc_tree()` terminates the entire subprocess tree so timed-out agents do not keep running in the background.
+69. Worker ignore rules (`.hive/`, `.agy/`, `result.json`, `__pycache__/`, `*.pyc`, `*.pyo`) are written to `.git/info/exclude` instead of `.gitignore`, so experiment branches never dirty the repository's `.gitignore`.
+70. `_detect_base_ref()` checks `origin/HEAD` first, then `origin/main`, `origin/master`, and other remote branches, and resets/cleans reused workspaces before checkout.
+71. On startup, `_load_persisted_runs()` marks any leftover `"starting"` or `"running"` runs from before a worker restart as `"failed"`.
+72. When `test_command` fails, `log_tail` reads from `test.log` so test failure output is visible in `hive status`.
+
+### Performance (P2, P5)
+73. `TaskRunner._ensure_mirror()` caches a local bare git repository per `repo_url` under `<workspace_root>/.mirrors/` and clones new run workspaces from the local cache before pointing `origin` at `repo_url`.
+74. `_safe_tail()` seeks to the end of the log file (last 64 KB) instead of reading the entire file into memory on every status poll.
+
+### Testing (local, not committed)
+75. Added 11 tests in `tests/test_runner_accuracy_perf.py` covering multiline prompt delivery with special characters over `.cmd` shims, `--permission-mode acceptEdits`, `--model` forwarding and validation, `"no_changes"` status, failed `git push` handling, process-tree termination on cancel and timeout, `.git/info/exclude` preservation of `.gitignore`, test failure log surfacing, stale run recovery on restart, cached git mirrors, and `_safe_tail`.
+76. Total worker suite: 92 passed, 3 skipped.

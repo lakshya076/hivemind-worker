@@ -28,8 +28,13 @@ class DispatchResponse(BaseModel):
 class StatusResponse(BaseModel):
     """Live status report for a specific run."""
     run_id: str
-    status: str = Field(..., description="starting | running | succeeded | failed | cancelled | unknown")
+    status: str = Field(
+        ...,
+        description="starting | running | succeeded | failed | no_changes | cancelled | unknown",
+    )
     branch: Optional[str] = None
+    pushed: Optional[bool] = Field(default=None, description="True once the branch is on origin")
+    commit: Optional[str] = Field(default=None, description="Commit SHA pushed to the branch")
     agent_engine: Optional[str] = None
     strategy: Optional[str] = None
     agent_exit_code: Optional[int] = None
