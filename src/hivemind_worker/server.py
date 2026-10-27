@@ -54,7 +54,10 @@ def create_app(
         )
 
     workspace_root = Path(app_config.workspace_root)
-    runner = TaskRunner(workspace_root)
+    runner = TaskRunner(
+        workspace_root,
+        max_concurrent_runs=app_config.max_concurrent_runs,
+    )
 
     allowed_networks = parse_networks(
         LOOPBACK_NETWORKS if insecure_no_auth else app_config.allowed_networks

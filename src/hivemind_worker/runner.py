@@ -243,12 +243,15 @@ class TaskRunner:
         *,
         agent_timeout: float = 1800.0,
         test_timeout: float = 300.0,
+        max_concurrent_runs: int = 2,
     ):
         self.workspace_root = workspace_root
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.mirrors_root = self.workspace_root / ".mirrors"
         self.agent_timeout = agent_timeout
         self.test_timeout = test_timeout
+        self.max_concurrent_runs = max(1, int(max_concurrent_runs))
+        self._run_slots = threading.Semaphore(self.max_concurrent_runs)
         self._runs: Dict[str, StatusResponse] = {}
         self._active_procs: Dict[str, subprocess.Popen] = {}
         self._cancelled: set[str] = set()
@@ -617,7 +620,13 @@ class TaskRunner:
             except Exception:
                 pass
 
+        slot_acquired = False
         try:
+            while not slot_acquired:
+                if self._is_cancelled(req.run_id):
+                    return
+                slot_acquired = self._run_slots.acquire(timeout=0.05)
+
             if self._is_cancelled(req.run_id):
                 return
 
@@ -856,4 +865,6 @@ class TaskRunner:
                     st.log_tail = _safe_tail(agent_log_path) or _safe_tail(wrapper_log_path)
                     st.finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         finally:
+            if slot_acquired:
+                self._run_slots.release()
             self._persist_result(req.run_id)

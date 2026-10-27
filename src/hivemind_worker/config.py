@@ -75,6 +75,12 @@ class WorkerConfig(BaseModel):
         default_factory=list,
         description="Extra DNS names clients may use to reach this worker (Host header allowlist)",
     )
+    max_concurrent_runs: int = Field(
+        default=2,
+        ge=1,
+        le=64,
+        description="Maximum number of agent tasks allowed to execute simultaneously",
+    )
 
     @field_validator("allowed_networks")
     @classmethod

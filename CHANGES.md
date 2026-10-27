@@ -137,3 +137,13 @@ Every change on this branch, one point each. Master-side changes are in the Hive
 84. `DispatchRequest` validates `repo_url` and `branch` on ingress (HTTP 422 on invalid values), and `TaskRunner` re-validates both before executing git commands.
 85. `git clone`, `git remote set-url`, and `git push` invocations in `runner.py` pass `--` before positional URL/branch arguments.
 86. Added 16 tests for S2 in `tests/test_runner_accuracy_perf.py` (total worker suite: 122 passed, 3 skipped).
+
+---
+
+## Round 5: medium-severity accuracy and performance improvements
+
+### P4: Bounded job concurrency queue
+87. `WorkerConfig` (`config.py`) adds `max_concurrent_runs` (default `2`, bounded `1..64`) and `create_app()` (`server.py`) passes it into `TaskRunner`.
+88. `TaskRunner` (`runner.py`) enforces `max_concurrent_runs` via a `threading.Semaphore` so excess dispatched runs wait in `"starting"` instead of spawning unbounded concurrent git clones, agent processes, and test suites.
+89. Queued runs waiting for an execution slot poll `_is_cancelled()` every 50 ms so `DELETE /cancel/<run_id>` immediately cancels queued tasks before they ever start.
+90. Added test `test_p4_max_concurrent_runs_queues_excess_jobs_and_allows_cancelling_queued_job` in `tests/test_runner_accuracy_perf.py`.
