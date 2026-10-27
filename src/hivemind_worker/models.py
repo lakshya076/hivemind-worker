@@ -64,18 +64,19 @@ def validate_branch_name(value: Optional[str]) -> Optional[str]:
 class DispatchRequest(BaseModel):
     """Payload sent by HiveMind master to trigger a task run."""
     run_id: str = Field(..., description="Unique identifier for the task run")
-    repo_url: str = Field(..., description="Git remote repository URL")
-    prompt: str = Field(..., description="Core task prompt or instruction")
-    strategy: str = Field(default="strategy-1", description="Assigned strategy name")
-    strategy_index: int = Field(default=1, description="1-based index of current strategy")
-    strategy_count: int = Field(default=1, description="Total number of parallel strategies")
+    repo_url: str = Field(..., max_length=2048, description="Git remote repository URL")
+    prompt: str = Field(..., min_length=1, max_length=200_000, description="Core task prompt or instruction")
+    strategy: str = Field(default="strategy-1", min_length=1, max_length=256, description="Assigned strategy name")
+    strategy_index: int = Field(default=1, ge=1, le=1000, description="1-based index of current strategy")
+    strategy_count: int = Field(default=1, ge=1, le=1000, description="Total number of parallel strategies")
     branch: Optional[str] = Field(default=None, description="Target branch to push (e.g. exp/worker-1-strategy)")
-    agent_engine: str = Field(default="claude-code", description="AI agent engine (aider, agy, claude-code)")
-    model: Optional[str] = Field(default=None, description="Optional model override")
-    test_command: Optional[str] = Field(default=None, description="Verification test command (e.g. 'pytest -q')")
-    bench_command: Optional[str] = Field(default=None, description="Benchmark command producing JSON metrics")
+    agent_engine: str = Field(default="claude-code", min_length=1, max_length=64, description="AI agent engine (aider, agy, claude-code)")
+    model: Optional[str] = Field(default=None, max_length=200, description="Optional model override")
+    test_command: Optional[str] = Field(default=None, max_length=4096, description="Verification test command (e.g. 'pytest -q')")
+    bench_command: Optional[str] = Field(default=None, max_length=4096, description="Benchmark command producing JSON metrics")
     workspace_dir: Optional[str] = Field(
         default=None,
+        max_length=1024,
         description="Deprecated/ignored client hint; runs are always confined to the worker's workspace_root",
     )
 

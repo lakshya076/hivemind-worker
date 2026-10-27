@@ -184,3 +184,7 @@ Every change on this branch, one point each. Master-side changes are in the Hive
 107. `TaskRunner._run_task_worker()` (`runner.py`) executes `bench_command` through `_run_managed_proc()` (logging output to `.hive/bench.log`) instead of raw `subprocess.run()`, so `DELETE /cancel/<run_id>` can terminate an active benchmark and a timed-out benchmark kills its entire child process tree via `_kill_proc_tree()`.
 108. Benchmark timeouts mark the run `"failed"` with a clear timeout message and surface the tail of `.hive/bench.log` in `log_tail`.
 109. Added `test_v5_bench_command_timeout_kills_process_tree_and_marks_failed` in `tests/test_runner_accuracy_perf.py`.
+
+### V8: Bounded payload fields in `DispatchRequest`
+110. `DispatchRequest` (`models.py`) enforces length and numeric bounds on `repo_url` (`<= 2048`), `prompt` (`1..200000`), `strategy` (`1..256`), `strategy_index` (`1..1000`), `strategy_count` (`1..1000`), `agent_engine` (`1..64`), `model` (`<= 200`), `test_command` (`<= 4096`), `bench_command` (`<= 4096`), and `workspace_dir` (`<= 1024`), rejecting oversized payloads with HTTP 422 before writing to disk.
+111. Added `test_v8_dispatch_request_enforces_payload_field_bounds` in `tests/test_runner_accuracy_perf.py` (total worker suite: 135 passed, 2 skipped).
