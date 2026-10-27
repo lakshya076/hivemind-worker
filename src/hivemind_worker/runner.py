@@ -5,6 +5,7 @@ import logging
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import threading
 from pathlib import Path
@@ -244,6 +245,7 @@ class TaskRunner:
         agent_timeout: float = 1800.0,
         test_timeout: float = 300.0,
         max_concurrent_runs: int = 2,
+        max_retained_workspaces: int = 20,
     ):
         self.workspace_root = workspace_root
         self.workspace_root.mkdir(parents=True, exist_ok=True)
@@ -251,6 +253,7 @@ class TaskRunner:
         self.agent_timeout = agent_timeout
         self.test_timeout = test_timeout
         self.max_concurrent_runs = max(1, int(max_concurrent_runs))
+        self.max_retained_workspaces = max(0, int(max_retained_workspaces))
         self._run_slots = threading.Semaphore(self.max_concurrent_runs)
         self._runs: Dict[str, StatusResponse] = {}
         self._active_procs: Dict[str, subprocess.Popen] = {}
@@ -401,6 +404,67 @@ class TaskRunner:
                 f.write(st.model_dump_json(indent=2))
         except Exception:
             pass
+
+    @staticmethod
+    def _remove_entry_readonly_safe(target: Path) -> None:
+        """Delete a file or directory tree, clearing read-only attributes (e.g. .git/objects/pack) if needed."""
+        def _onerror(func, path, _exc_info):
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            except Exception:
+                pass
+
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target, onerror=_onerror)
+        else:
+            try:
+                target.unlink()
+            except PermissionError:
+                try:
+                    os.chmod(target, stat.S_IWRITE)
+                    target.unlink()
+                except Exception:
+                    pass
+            except FileNotFoundError:
+                pass
+
+    def prune_old_workspaces(self, keep: Optional[int] = None) -> int:
+        """Delete git working trees of older completed runs while preserving result.json and .hive/ logs."""
+        keep_count = self.max_retained_workspaces if keep is None else max(0, int(keep))
+        terminal_statuses = ("succeeded", "failed", "no_changes", "cancelled")
+        with self._lock:
+            completed = [
+                r for r in self._runs.values()
+                if r.status in terminal_statuses
+            ]
+        completed.sort(
+            key=lambda r: (r.finished_at or r.started_at or "", r.run_id),
+            reverse=True,
+        )
+        to_prune = completed[keep_count:]
+        pruned_runs = 0
+        preserved_names = {"result.json", ".hive"}
+
+        for run in to_prune:
+            try:
+                run_dir = self._run_dir_for(run.run_id)
+            except ValueError:
+                continue
+            if not run_dir.exists() or not run_dir.is_dir():
+                continue
+            removed_any = False
+            try:
+                for entry in list(run_dir.iterdir()):
+                    if entry.name in preserved_names:
+                        continue
+                    self._remove_entry_readonly_safe(entry)
+                    removed_any = True
+            except Exception:
+                pass
+            if removed_any:
+                pruned_runs += 1
+        return pruned_runs
 
     def _ensure_mirror(self, repo_url: str, env: Dict[str, str]) -> Optional[Path]:
         """Create or update a local bare mirror for repo_url so clones stay local and fast."""
@@ -868,3 +932,7 @@ class TaskRunner:
             if slot_acquired:
                 self._run_slots.release()
             self._persist_result(req.run_id)
+            try:
+                self.prune_old_workspaces()
+            except Exception:
+                pass

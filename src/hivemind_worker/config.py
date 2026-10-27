@@ -81,6 +81,11 @@ class WorkerConfig(BaseModel):
         le=64,
         description="Maximum number of agent tasks allowed to execute simultaneously",
     )
+    max_retained_workspaces: int = Field(
+        default=20,
+        ge=0,
+        description="Number of completed run working trees to keep on disk (result.json and .hive/ logs are always kept)",
+    )
 
     @field_validator("allowed_networks")
     @classmethod

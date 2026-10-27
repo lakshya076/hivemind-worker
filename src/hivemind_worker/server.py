@@ -57,6 +57,7 @@ def create_app(
     runner = TaskRunner(
         workspace_root,
         max_concurrent_runs=app_config.max_concurrent_runs,
+        max_retained_workspaces=app_config.max_retained_workspaces,
     )
 
     allowed_networks = parse_networks(

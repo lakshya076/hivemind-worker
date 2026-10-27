@@ -147,3 +147,9 @@ Every change on this branch, one point each. Master-side changes are in the Hive
 88. `TaskRunner` (`runner.py`) enforces `max_concurrent_runs` via a `threading.Semaphore` so excess dispatched runs wait in `"starting"` instead of spawning unbounded concurrent git clones, agent processes, and test suites.
 89. Queued runs waiting for an execution slot poll `_is_cancelled()` every 50 ms so `DELETE /cancel/<run_id>` immediately cancels queued tasks before they ever start.
 90. Added test `test_p4_max_concurrent_runs_queues_excess_jobs_and_allows_cancelling_queued_job` in `tests/test_runner_accuracy_perf.py`.
+
+### P3: Automatic worker workspace retention and git checkout pruning
+91. `WorkerConfig` (`config.py`) adds `max_retained_workspaces` (default `20`, `>= 0`) and `create_app()` (`server.py`) passes it into `TaskRunner`.
+92. New `TaskRunner.prune_old_workspaces()` (`runner.py`) sorts completed runs (`succeeded`, `failed`, `no_changes`, `cancelled`) newest-first and deletes the checked-out repository files and `.git` directory from runs older than the newest `max_retained_workspaces` while preserving `result.json` and `.hive/` logs so `/runs` and `/status/<run_id>` retain full history.
+93. `_remove_entry_readonly_safe()` clears read-only attributes before unlinking so Windows `.git/objects/pack/*` files are removed cleanly, and `_run_task_worker()` triggers `prune_old_workspaces()` automatically on task completion.
+94. Added test `test_p3_prune_old_workspaces_removes_git_checkouts_but_preserves_results_and_logs` in `tests/test_runner_accuracy_perf.py` (total worker suite: 124 passed, 3 skipped).
