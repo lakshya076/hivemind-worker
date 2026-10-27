@@ -153,3 +153,13 @@ Every change on this branch, one point each. Master-side changes are in the Hive
 92. New `TaskRunner.prune_old_workspaces()` (`runner.py`) sorts completed runs (`succeeded`, `failed`, `no_changes`, `cancelled`) newest-first and deletes the checked-out repository files and `.git` directory from runs older than the newest `max_retained_workspaces` while preserving `result.json` and `.hive/` logs so `/runs` and `/status/<run_id>` retain full history.
 93. `_remove_entry_readonly_safe()` clears read-only attributes before unlinking so Windows `.git/objects/pack/*` files are removed cleanly, and `_run_task_worker()` triggers `prune_old_workspaces()` automatically on task completion.
 94. Added test `test_p3_prune_old_workspaces_removes_git_checkouts_but_preserves_results_and_logs` in `tests/test_runner_accuracy_perf.py` (total worker suite: 124 passed, 3 skipped).
+
+---
+
+## Round 6: deep security audit fixes (High severity)
+
+### V1: Post-agent git hook / `.git/config` neutralization and UNC share rejection
+95. New `_sanitize_git_dir()` (`runner.py`) clears `.git/hooks/` and restores `.git/config` from a pre-agent snapshot immediately after the agent exits and before post-agent git commands run, preventing a prompt-injected agent (under `--permission-mode acceptEdits`) from executing arbitrary commands via `pre-commit`/`pre-push` hooks or `core.fsmonitor`/`core.hooksPath`/`core.sshCommand`.
+96. Post-agent `git status`, `git add`, `git commit`, and `git push` invocations pass `-c core.hooksPath=<empty_hooks_dir>`, `-c core.fsmonitor=false`, and `--no-verify`.
+97. `validate_repo_url()` (`models.py`) rejects Windows/POSIX UNC network share paths (`\\server\share`, `//server/share`, `file:////...`) to prevent SMB NTLM hash coercion.
+98. Added 5 tests for V1 in `tests/test_runner_accuracy_perf.py`.

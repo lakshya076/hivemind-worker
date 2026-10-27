@@ -170,6 +170,8 @@ def _write_git_exclude(run_dir: Path) -> None:
     exclude_path = run_dir / ".git" / "info" / "exclude"
     patterns = [".hive/", ".agy/", "result.json", "__pycache__/", "*.pyc", "*.pyo"]
     try:
+        if exclude_path.is_symlink():
+            exclude_path.unlink()
         exclude_path.parent.mkdir(parents=True, exist_ok=True)
         existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
         existing_lines = {line.strip() for line in existing.splitlines()}
@@ -178,6 +180,41 @@ def _write_git_exclude(run_dir: Path) -> None:
             prefix = "" if (not existing or existing.endswith("\n")) else "\n"
             with open(exclude_path, "a", encoding="utf-8") as f:
                 f.write(prefix + "# HiveMind worker artifacts\n" + "\n".join(missing) + "\n")
+    except Exception:
+        pass
+
+
+def _sanitize_git_dir(run_dir: Path, config_snapshot: Optional[bytes] = None) -> None:
+    """Neutralize .git/hooks and restore .git/config so an agent with file-edit access
+    cannot execute shell commands via pre-commit/pre-push hooks or core.fsmonitor/sshCommand."""
+    git_dir = run_dir / ".git"
+    if not git_dir.exists() or git_dir.is_symlink():
+        return
+
+    if config_snapshot is not None:
+        cfg_file = git_dir / "config"
+        try:
+            if cfg_file.is_symlink():
+                cfg_file.unlink()
+            cfg_file.write_bytes(config_snapshot)
+        except Exception:
+            pass
+
+    hooks_dir = git_dir / "hooks"
+    try:
+        if hooks_dir.is_symlink() or (hooks_dir.exists() and not hooks_dir.is_dir()):
+            hooks_dir.unlink()
+        if hooks_dir.exists():
+            for entry in list(hooks_dir.iterdir()):
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    try:
+                        entry.unlink()
+                    except Exception:
+                        pass
+        else:
+            hooks_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
 
@@ -250,6 +287,8 @@ class TaskRunner:
         self.workspace_root = workspace_root
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.mirrors_root = self.workspace_root / ".mirrors"
+        self.empty_hooks_dir = self.workspace_root / ".empty-hooks"
+        self.empty_hooks_dir.mkdir(parents=True, exist_ok=True)
         self.agent_timeout = agent_timeout
         self.test_timeout = test_timeout
         self.max_concurrent_runs = max(1, int(max_concurrent_runs))
@@ -600,6 +639,7 @@ class TaskRunner:
         else:
             subprocess.run(["git", "checkout", "-B", branch], cwd=run_dir, capture_output=True, env=env)
 
+        _sanitize_git_dir(run_dir)
         return _git_head(run_dir, env)
 
     def _run_managed_proc(
@@ -698,6 +738,8 @@ class TaskRunner:
             base_head = self._prepare_git_workspace(req, run_dir, branch, env, log_wrapper)
             if self._is_cancelled(req.run_id):
                 return
+            git_config_path = run_dir / ".git" / "config"
+            git_config_snapshot = git_config_path.read_bytes() if git_config_path.exists() else None
 
             # 2. Setup run directory metadata files
             hive_meta_dir.mkdir(parents=True, exist_ok=True)
@@ -771,6 +813,9 @@ class TaskRunner:
                 self._runs[req.run_id].agent_exit_code = agent_exit
             log_wrapper(f"Agent finished with exit code {agent_exit}")
 
+            # Neutralize any git hooks or .git/config modifications written by the agent
+            _sanitize_git_dir(run_dir, git_config_snapshot)
+
             # 6. Run Test Command if specified
             test_exit = None
             if req.test_command:
@@ -835,9 +880,15 @@ class TaskRunner:
                 return
 
             # 8. Git Commit & Push
+            _sanitize_git_dir(run_dir, git_config_snapshot)
             _write_git_exclude(run_dir)
+            safe_git = [
+                "git",
+                "-c", f"core.hooksPath={self.empty_hooks_dir}",
+                "-c", "core.fsmonitor=false",
+            ]
             status_res = subprocess.run(
-                ["git", "status", "--porcelain"],
+                [*safe_git, "status", "--porcelain"],
                 cwd=run_dir,
                 capture_output=True,
                 text=True,
@@ -847,9 +898,9 @@ class TaskRunner:
 
             if dirty_tree:
                 log_wrapper("Modifications detected. Committing changes...")
-                subprocess.run(["git", "add", "-A"], cwd=run_dir, capture_output=True, env=env)
+                subprocess.run([*safe_git, "add", "-A"], cwd=run_dir, capture_output=True, env=env)
                 subprocess.run(
-                    ["git", "commit", "-m", f"hive: {req.strategy} (run {req.run_id})"],
+                    [*safe_git, "commit", "--no-verify", "-m", f"hive: {req.strategy} (run {req.run_id})"],
                     cwd=run_dir,
                     capture_output=True,
                     text=True,
@@ -869,7 +920,7 @@ class TaskRunner:
             if has_changes:
                 log_wrapper(f"Pushing branch {branch} to origin...")
                 push_res = subprocess.run(
-                    ["git", "push", "-u", "--force", "origin", "--", branch],
+                    [*safe_git, "push", "--no-verify", "-u", "--force", "origin", "--", branch],
                     cwd=run_dir,
                     capture_output=True,
                     text=True,

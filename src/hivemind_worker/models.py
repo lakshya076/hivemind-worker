@@ -28,7 +28,11 @@ def validate_repo_url(value: str) -> str:
         raise ValueError("repo_url cannot be empty")
     if cleaned.startswith("-"):
         raise ValueError(f"Invalid repo_url {value!r}: cannot start with '-'")
+    if cleaned.startswith(("\\\\", "//")):
+        raise ValueError(f"Invalid repo_url {value!r}: UNC network share paths are not allowed")
     lower = cleaned.lower()
+    if lower.startswith(("file:////", "file://\\\\")):
+        raise ValueError(f"Invalid repo_url {value!r}: UNC file URLs are not allowed")
     if lower.startswith(_FORBIDDEN_URL_PREFIXES) or "::" in lower.split("://", 1)[0]:
         raise ValueError(f"Invalid repo_url {value!r}: forbidden git remote helper protocol")
     if any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in cleaned):
