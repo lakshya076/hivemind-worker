@@ -42,10 +42,11 @@ def _safe_tail(file_path: Path, max_lines: int = 30, max_bytes: int = 65536) -> 
         return ""
 
 
-def _build_stripped_env(workspace_dir: Path) -> Dict[str, str]:
+def _build_stripped_env(workspace_dir: Path, *, include_ai_keys: bool = True) -> Dict[str, str]:
     """
-    Construct a secure, stripped environment dictionary for the agent subprocess.
-    Includes only essential execution paths and AI provider API keys.
+    Construct a secure, stripped environment dictionary for worker subprocesses.
+    AI provider API keys are included only when ``include_ai_keys=True`` (for the
+    AI coding agent) and omitted for git, test, and benchmark subprocesses.
     """
     env: Dict[str, str] = {}
 
@@ -74,38 +75,39 @@ def _build_stripped_env(workspace_dir: Path) -> Dict[str, str]:
         if key in os.environ:
             env[key] = os.environ[key]
 
-    # 2. AI Provider API Keys
-    ai_keys = [
-        "OPENROUTER_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "OPENAI_API_KEY",
-        "GROQ_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "MISTRAL_API_KEY",
-    ]
-    # Check current os.environ first
-    for key in ai_keys:
-        if key in os.environ:
-            env[key] = os.environ[key]
+    # 2. AI Provider API Keys (only for agent subprocesses, never for test/bench/git)
+    if include_ai_keys:
+        ai_keys = [
+            "OPENROUTER_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENAI_API_KEY",
+            "GROQ_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "MISTRAL_API_KEY",
+        ]
+        # Check current os.environ first
+        for key in ai_keys:
+            if key in os.environ:
+                env[key] = os.environ[key]
 
-    # Also load from ~/.env if present and not already set
-    env_file = Path.home() / ".env"
-    if env_file.exists():
-        try:
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith("export "):
-                    line = line[7:].strip()
-                if "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    k = k.strip()
-                    v = v.strip().strip("\"'")
-                    if k in ai_keys and k not in env:
-                        env[k] = v
-        except Exception:
-            pass
+        # Also load from ~/.env if present and not already set
+        env_file = Path.home() / ".env"
+        if env_file.exists():
+            try:
+                for line in env_file.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line.startswith("export "):
+                        line = line[7:].strip()
+                    if "=" in line and not line.startswith("#"):
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("\"'")
+                        if k in ai_keys and k not in env:
+                            env[k] = v
+            except Exception:
+                pass
 
     # 3. Default Git Author / Committer config + non-interactive git
     env["GIT_AUTHOR_NAME"] = os.environ.get("GIT_AUTHOR_NAME", "HiveMind Worker")
@@ -705,7 +707,8 @@ class TaskRunner:
             self._persist_result(req.run_id)
             return
 
-        env = _build_stripped_env(run_dir)
+        env = _build_stripped_env(run_dir, include_ai_keys=False)
+        agent_env = _build_stripped_env(run_dir, include_ai_keys=True)
         branch = req.branch or f"exp/{req.run_id[:12]}-worker-{req.strategy}"
 
         hive_meta_dir = run_dir / ".hive"
@@ -789,7 +792,7 @@ class TaskRunner:
                     req.run_id,
                     exec_args,
                     cwd=run_dir,
-                    env=env,
+                    env=agent_env,
                     shell=False,
                     stdin_file=cmd.stdin_file,
                     stdout_path=agent_log_path,

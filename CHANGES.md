@@ -163,3 +163,8 @@ Every change on this branch, one point each. Master-side changes are in the Hive
 96. Post-agent `git status`, `git add`, `git commit`, and `git push` invocations pass `-c core.hooksPath=<empty_hooks_dir>`, `-c core.fsmonitor=false`, and `--no-verify`.
 97. `validate_repo_url()` (`models.py`) rejects Windows/POSIX UNC network share paths (`\\server\share`, `//server/share`, `file:////...`) to prevent SMB NTLM hash coercion.
 98. Added 5 tests for V1 in `tests/test_runner_accuracy_perf.py`.
+
+### V2: Isolate AI provider API keys from `test_command`, `bench_command`, and `git`
+99. `_build_stripped_env()` (`runner.py`) adds an `include_ai_keys` parameter (`True` by default for backward compatibility).
+100. `TaskRunner._run_task_worker()` passes AI provider API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`) only to the AI agent subprocess and omits them from `git`, `test_command`, and `bench_command` subprocesses so agent-modified tests or benchmarks cannot exfiltrate API keys into logs or commits.
+101. Added `test_v2_ai_api_keys_are_passed_to_agent_but_never_leaked_to_test_or_bench_commands` in `tests/test_runner_accuracy_perf.py`.
