@@ -56,6 +56,8 @@ def create_app(
     workspace_root = Path(app_config.workspace_root)
     runner = TaskRunner(
         workspace_root,
+        agent_timeout=app_config.agent_timeout,
+        test_timeout=app_config.test_timeout,
         max_concurrent_runs=app_config.max_concurrent_runs,
         max_retained_workspaces=app_config.max_retained_workspaces,
     )

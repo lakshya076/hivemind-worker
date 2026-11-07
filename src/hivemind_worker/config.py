@@ -86,6 +86,16 @@ class WorkerConfig(BaseModel):
         ge=0,
         description="Number of completed run working trees to keep on disk (result.json and .hive/ logs are always kept)",
     )
+    agent_timeout: float = Field(
+        default=1800.0,
+        gt=0,
+        description="Seconds an agent session may run before its process tree is killed",
+    )
+    test_timeout: float = Field(
+        default=300.0,
+        gt=0,
+        description="Seconds each test or benchmark command may run before it is killed",
+    )
 
     @field_validator("allowed_networks")
     @classmethod
