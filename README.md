@@ -10,10 +10,15 @@ Runs on Linux, macOS, and Windows. Eliminates raw SSH dependency and provides is
 
 ### 1. Installation
 
+`hivemind-worker` is not published to PyPI. Install it from a clone of this repository:
+
 ```bash
-# Install via pip or uv
-pip install hivemind-worker
+git clone https://github.com/lakshya076/hivemind-worker.git
+cd hivemind-worker
+uv tool install -e .    # or, inside a virtualenv: pip install -e .
 ```
+
+The editable install picks up code changes on the next `hivemind-worker start`. Re-run `uv tool install -e . --force` only after dependencies in `pyproject.toml` change.
 
 ### 2. Run Worker Daemon
 
@@ -58,29 +63,69 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
 | `host` / `port` | `0.0.0.0` / `7422` | Bind address |
 | `allowed_networks` | private + Tailscale ranges | Source CIDRs allowed to connect. E.g. `["100.64.0.0/10"]` for a Tailscale-only worker |
 | `allowed_hosts` | `[]` | Extra DNS names the master may use to reach this worker (see below) |
+| `max_concurrent_runs` | `2` | Agent tasks allowed to execute at the same time; extra dispatches wait for a slot |
+| `max_retained_workspaces` | `20` | Completed run working trees kept on disk (`result.json` and `.hive/` logs are always kept) |
+| `agent_timeout` | `1800` | Seconds an agent session may run before its process tree is killed |
+| `test_timeout` | `300` | Seconds each test or benchmark command may run before it is killed |
 
 ---
 
 ## 📡 API Endpoints
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/health` | Hardware and tool capability probe (<0.1s response) |
-| `POST` | `/dispatch` | Dispatches an AI agent run in an isolated workspace |
-| `GET` | `/status/{run_id}` | Polls live status, git branch, test results, and log tail |
-| `DELETE` | `/cancel/{run_id}` | Aborts a running task and terminates the agent process tree |
-| `GET` | `/runs` | Lists all historical and active runs |
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/` | none | Identifies the daemon (`name`, `version`). `hive discover` uses it to find workers without sending the key |
+| `GET` | `/health` | key | Hardware and tool capability probe (<0.1s response) |
+| `POST` | `/dispatch` | key | Dispatches an AI agent run in an isolated workspace |
+| `GET` | `/status/{run_id}` | key | Polls live status, git branch, test results, and log tail |
+| `DELETE` | `/cancel/{run_id}` | key | Aborts a queued or running task and terminates its process tree |
+| `GET` | `/runs` | key | Lists all historical and active runs |
+
+`/dispatch` rejects invalid payloads with HTTP 422 before anything touches disk: a `run_id` that is not 1–128 characters of `[A-Za-z0-9._-]` (or contains `..`), a `repo_url` or `branch` that could be read as a git option or remote helper, a model name with characters outside `[A-Za-z0-9._:/@+-]` or not starting with a letter or digit, and oversized fields (prompt over 200,000 characters, `repo_url` over 2,048, test or bench command over 4,096).
+
+---
+
+## ⚙️ How a Run Works
+
+1. **Queue.** The run starts as `starting` and waits for one of `max_concurrent_runs` slots. A queued run can be cancelled before it starts.
+2. **Workspace.** The run gets `<workspace_root>/<run_id>/`. The client's `workspace_dir` hint is ignored. Each `repo_url` is cached as a bare mirror in `<workspace_root>/.mirrors/`, so later clones are local and fast; `origin` still points at `repo_url`.
+3. **Branch.** The worker checks out the branch the master sends (`exp/<run_id>/<worker>-<strategy>`) from the remote default branch (`origin/HEAD`, then `origin/main`, then `origin/master`). If the master sends no branch, the worker uses `exp/<first 12 characters of run_id>-worker-<strategy>`. Worker files (`.hive/`, `result.json`, `__pycache__/`) are listed in `.git/info/exclude`, so the repository's `.gitignore` is never changed.
+4. **Agent.** The prompt, plus a line naming the strategy, is written to `.hive/prompt.txt`:
+   - Aider reads it with `--message-file`.
+   - Claude Code reads it from stdin and runs with `--permission-mode acceptEdits`, so it can edit files but not run shell commands.
+   - `agy` takes the prompt as an argument, so it must be a native executable. The worker refuses to pass a prompt to a `.cmd`/`.bat` shim.
+   - No agent is ever started through a shell. The agent is killed with its whole process tree after `agent_timeout` seconds.
+5. **Tests and benchmark.** `test_command` and `bench_command` run in the workspace and are killed after `test_timeout` seconds. Benchmark output is parsed as JSON; output that is not JSON is kept as `{"raw_output": ...}`.
+6. **Commit and push.** Changes are committed as `hive: <strategy> (run <run_id>)` and force-pushed to the branch.
+7. **Result.** The final status is written to `<run_id>/result.json`. Logs stay in `<run_id>/.hive/` (`wrapper.log`, `agent.log`, `test.log`, `bench.log`).
+
+| Status | Meaning |
+|---|---|
+| `starting` | Queued or preparing the workspace |
+| `running` | Agent, tests or benchmark in progress |
+| `succeeded` | Agent exited 0, tests passed (or none given), and the branch was pushed (`pushed: true`, `commit` set) |
+| `no_changes` | Agent and tests succeeded but no files changed; nothing was pushed |
+| `failed` | Agent exited non-zero, tests failed, a timeout hit, `git push` failed, or the worker restarted mid-run. `error` says which |
+| `cancelled` | Cancelled through `DELETE /cancel/{run_id}`; tests, commit and push are skipped |
+
+After each run, working trees beyond the newest `max_retained_workspaces` completed runs are deleted. `result.json` and `.hive/` logs are kept, so `/runs` and `/status` keep the full history.
 
 ---
 
 ## 🛡️ Security Features
 
-- **Mandatory Fleet API Key Authentication**: Rejects unauthenticated requests with HTTP 401. The daemon refuses to run without a key (except `--insecure-no-auth`, which is loopback-only).
+**Network and authentication**
+- **Mandatory Fleet API Key Authentication**: Rejects unauthenticated requests with HTTP 401. The daemon refuses to run without a key (except `--insecure-no-auth`, which is loopback-only). If the key disappears at runtime, requests get 503 instead of being let through.
 - **Private-Network Allowlist**: Requests from addresses outside `allowed_networks` are rejected with 403 before authentication, so a worker accidentally exposed to the internet (cloud VM, port forward) is not reachable.
 - **Browser Request Blocking**: No CORS is served, and any request carrying `Origin` or a cross-site `Sec-Fetch-Site` header is rejected with 403. Web pages cannot drive the worker.
 - **DNS-Rebinding Protection**: The `Host` header must be an IP address, `localhost`, this machine's hostname, its Tailscale MagicDNS name, or an entry in `allowed_hosts`; anything else gets 400.
-- **Workspace Isolation**: Git operations and file edits are strictly scoped to the assigned task directory.
-- **Stripped Subprocess Environment**: Subprocesses receive only essential execution variables (`PATH`, git user config, target API keys) — no host SSH keys or personal credentials.
+- **Fail-closed config**: If `worker.json` exists but cannot be read or validated, the daemon refuses to start instead of falling back to a keyless default.
+
+**Runs**
+- **Workspace confinement**: Every run lives in `<workspace_root>/<run_id>/`; the `run_id` is validated so it cannot escape. The worker never follows symlinks, hardlinks or NTFS junctions when reading logs or deleting old workspaces, so a run cannot make it read or delete files outside the workspace.
+- **Git injection protection**: `repo_url` values that start with `-`, use remote helpers (`ext::`, `fd::`), are UNC network shares (`\\server\share`, `//server/share`), or contain whitespace are rejected. Git commands pass `--` before URLs and branch names.
+- **Agent cannot hijack git**: After the agent exits, the worker deletes anything in `.git/hooks/` and restores `.git/config` from a copy taken before the agent ran. Commit and push run with an empty hooks directory, `core.fsmonitor=false` and `--no-verify`.
+- **AI keys go to the agent only**: Subprocesses get a stripped environment: `PATH`, OS essentials, `HOME`, and a git identity, with no other variables (no `SSH_AUTH_SOCK`, cloud credentials, and so on). AI provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`) are read from the environment or `~/.env` and passed **only** to the agent. Tests, benchmarks and git never see them, so agent-written tests cannot leak them.
 
 ---
 
@@ -191,5 +236,16 @@ nssm start HiveMindWorker
 ### Reaching the worker by name
 
 The master normally connects by IP (LAN or Tailscale `100.x`), which always works. Connecting by name also works for `localhost`, the machine's hostname (and `<hostname>.local`), and its Tailscale MagicDNS name (picked up automatically, even if Tailscale starts after the worker). For any other DNS name, add it to `allowed_hosts` in the worker config.
+
+---
+
+## 🧪 Development & Tests
+
+Tests live in `tests/` and use pytest. They run offline: the HTTP API is driven through FastAPI's `TestClient`, and full runs use a temporary local git origin with a stand-in Python script as the agent, so no AI CLI or API key is needed. Your real `~/.hivemind` and `~/.env` are never read.
+
+```bash
+uv run pytest            # creates .venv with the dev dependency group on first run
+uv run pytest -k runner  # run a subset
+```
 
 
