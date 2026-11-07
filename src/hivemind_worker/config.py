@@ -96,6 +96,11 @@ class WorkerConfig(BaseModel):
         gt=0,
         description="Seconds each test or benchmark command may run before it is killed",
     )
+    git_timeout: float = Field(
+        default=300.0,
+        gt=0,
+        description="Seconds each git clone, fetch, or push operation may run before it is killed",
+    )
 
     @field_validator("allowed_networks")
     @classmethod
