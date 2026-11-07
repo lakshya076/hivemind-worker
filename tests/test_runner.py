@@ -327,6 +327,86 @@ def test_huge_benchmark_output_is_not_read_whole(tmp_path, origin_repo, fake_age
     assert len((tmp_path / "ws" / "r1" / "result.json").read_bytes()) < 20_000
 
 
+def add_branch(tmp_path, origin, git, name, marker):
+    """Push a branch to origin whose tree has an extra marker file."""
+    work = tmp_path / f"branch-{name.replace('/', '-')}"
+    git(tmp_path, "clone", str(origin), str(work))
+    git(work, "checkout", "-b", name)
+    (work / marker).write_text("from base\n", encoding="utf-8")
+    git(work, "add", "-A")
+    git(work, "commit", "-m", f"base {name}")
+    git(work, "push", "origin", name)
+
+
+def test_run_starts_from_requested_base_branch(tmp_path, origin_repo, fake_agent, git):
+    add_branch(tmp_path, origin_repo, git, "feature/login", "BASE_MARKER")
+    runner = TaskRunner(tmp_path / "ws")
+    req = dispatch(runner, origin_repo, base_branch="feature/login")
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "succeeded", st.error
+    assert st.base_branch == "feature/login"
+    files = git(origin_repo, "ls-tree", "-r", "--name-only", req.branch).splitlines()
+    assert "BASE_MARKER" in files and "feature.txt" in files
+    # The pushed branch sits on top of the base, not on main.
+    assert git(origin_repo, "merge-base", "--is-ancestor", "feature/login", req.branch) == ""
+
+
+def test_default_base_is_reported(tmp_path, origin_repo, fake_agent):
+    runner = TaskRunner(tmp_path / "ws")
+    dispatch(runner, origin_repo)
+    assert wait_for(runner, "r1").base_branch == "main"
+
+
+def test_missing_base_branch_fails_without_falling_back(tmp_path, origin_repo, fake_agent, git):
+    runner = TaskRunner(tmp_path / "ws")
+    req = dispatch(runner, origin_repo, base_branch="does-not-exist")
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "failed"
+    assert "Base branch 'does-not-exist' not found on origin" in st.error
+    assert st.agent_exit_code is None  # the agent never ran on the default branch instead
+    assert git(origin_repo, "branch", "--list", req.branch) == ""
+
+
+def test_read_log_returns_the_end_of_large_logs(tmp_path):
+    runner = TaskRunner(tmp_path / "ws")
+    runner._runs["r1"] = StatusResponse(run_id="r1", status="succeeded")
+    hive = tmp_path / "ws" / "r1" / ".hive"
+    hive.mkdir(parents=True)
+    (hive / "agent.log").write_bytes("".join(f"line {i}\n" for i in range(1000)).encode())
+
+    whole = runner.read_log("r1", "agent", 1 << 20)
+    tail = runner.read_log("r1", "agent", 20)
+
+    assert whole["truncated"] is False and whole["content"].startswith("line 0\n")
+    assert tail["truncated"] is True and tail["size"] == whole["size"]
+    assert tail["content"].endswith("line 999\n") and len(tail["content"]) == 20
+
+
+def test_read_log_refuses_unknown_runs_missing_logs_and_links(tmp_path):
+    runner = TaskRunner(tmp_path / "ws")
+    runner._runs["r1"] = StatusResponse(run_id="r1", status="running")
+    hive = tmp_path / "ws" / "r1" / ".hive"
+    hive.mkdir(parents=True)
+    secret = tmp_path / "worker.json"
+    secret.write_text('{"fleet_key": "secret"}', encoding="utf-8")
+    os.link(secret, hive / "test.log")  # planted hardlink to a secret
+
+    with pytest.raises(KeyError):
+        runner.read_log("unknown", "agent", 100)
+    with pytest.raises(ValueError):
+        runner.read_log("../escape", "agent", 100)
+    with pytest.raises(FileNotFoundError):
+        runner.read_log("r1", "agent", 100)  # not written yet
+    with pytest.raises(FileNotFoundError):
+        runner.read_log("r1", "test", 100)  # hardlink refused
+    with pytest.raises(FileNotFoundError):
+        runner.read_log("r1", "../../worker", 100)  # only the four known logs
+
+
 def test_failed_mirror_refresh_is_never_used(tmp_path, origin_repo):
     runner = TaskRunner(tmp_path / "ws")
     env = _build_stripped_env(tmp_path, include_ai_keys=False)

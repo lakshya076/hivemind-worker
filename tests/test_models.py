@@ -95,6 +95,18 @@ def test_dispatch_request_normalizes_supported_engines(engine, stored):
     assert base_request(agent_engine=engine).agent_engine == stored
 
 
+@pytest.mark.parametrize("base", ["main", "develop", "feature/login", "release/1.2", "exp/123/ari-simd"])
+def test_any_valid_branch_can_be_a_base(base):
+    # The base is only read, never pushed, so it need not be under exp/.
+    assert base_request(base_branch=base).base_branch == base
+
+
+@pytest.mark.parametrize("base", ["--upload-pack=x", "a..b", "a b", "a@{1}", "main.lock", "-main"])
+def test_bad_base_branches_rejected(base):
+    with pytest.raises(ValidationError):
+        base_request(base_branch=base)
+
+
 def test_dispatch_request_ignores_legacy_workspace_dir():
     # Masters before HiveMind #4 still send it; it must not break dispatch.
     req = DispatchRequest(run_id="r1", repo_url="https://x/y.git", prompt="p", workspace_dir="/etc")

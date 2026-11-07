@@ -75,6 +75,33 @@ def test_health_with_key(app):
     assert resp.json()["active_runs"] == []
 
 
+def test_health_advertises_features(app):
+    # Masters refuse --base / full logs on workers that don't list them.
+    assert set(client_for(app).get("/health", headers=AUTH).json()["features"]) >= {"base_branch", "logs"}
+
+
+def test_logs_endpoint(app, tmp_path):
+    from hivemind_worker.models import StatusResponse
+
+    app.state.runner._runs["r1"] = StatusResponse(run_id="r1", status="failed")
+    hive = tmp_path / "ws" / "r1" / ".hive"
+    hive.mkdir(parents=True)
+    (hive / "test.log").write_bytes(b"x" * 100 + b"FAILED test_add\n")
+    client = client_for(app)
+
+    ok = client.get("/logs/r1", params={"file": "test", "max_bytes": 16}, headers=AUTH)
+    assert ok.status_code == 200
+    assert ok.json() == {"run_id": "r1", "file": "test", "size": 116, "truncated": True, "content": "FAILED test_add\n"}
+
+    assert client.get("/logs/r1", headers=AUTH).status_code == 404  # no agent log yet
+    assert "has no agent log" in client.get("/logs/r1", headers=AUTH).json()["detail"]
+    assert client.get("/logs/nope", headers=AUTH).status_code == 404
+    assert client.get("/logs/r1", params={"file": "../../worker"}, headers=AUTH).status_code == 422
+    assert client.get("/logs/r1", params={"max_bytes": 0}, headers=AUTH).status_code == 422
+    assert client.get("/logs/r1", params={"max_bytes": 6 * 1024 * 1024}, headers=AUTH).status_code == 422
+    assert client.get("/logs/r1", params={"file": "test"}).status_code == 401
+
+
 def test_public_source_address_rejected_before_auth(app):
     resp = client_for(app, client=("8.8.8.8", 1)).get("/health", headers=AUTH)
     assert resp.status_code == 403

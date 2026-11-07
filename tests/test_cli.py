@@ -55,6 +55,6 @@ def test_requests_are_logged_once(tmp_path, started):
     assert started["access_log"] is False
 
 
-def test_version_reports_0_2_0():
+def test_version_reports_0_3_0():
     result = CliRunner().invoke(main, ["--version"])
-    assert "0.2.0" in result.output
+    assert "0.3.0" in result.output

@@ -73,6 +73,9 @@ def _safe_tail(
 
 BENCH_OUTPUT_LIMIT = 64 * 1024
 
+# Logs GET /logs/{run_id}?file=<name> may serve, all inside the run's .hive/ folder.
+LOG_FILES = {"agent": "agent.log", "test": "test.log", "bench": "bench.log", "wrapper": "wrapper.log"}
+
 
 def _read_bench_output(bench_log_path: Path):
     """Parse benchmark output as JSON, else keep it as raw text.
@@ -418,6 +421,37 @@ class TaskRunner:
                 st.log_tail = _safe_tail(agent_log) or _safe_tail(wrapper_log)
             return st
 
+    def read_log(self, run_id: str, name: str, max_bytes: int) -> Dict[str, object]:
+        """Return the last ``max_bytes`` of one of a run's logs (.hive/<name>.log).
+
+        Raises KeyError for an unknown run and FileNotFoundError when that log does not
+        exist (yet). Like _safe_tail, it never follows a symlink, junction or hardlink an
+        agent or test may have planted to read files outside the run.
+        """
+        if name not in LOG_FILES:
+            raise FileNotFoundError(name)
+        run_dir = self._run_dir_for(run_id)
+        with self._lock:
+            if run_id not in self._runs:
+                raise KeyError(run_id)
+        path = run_dir / ".hive" / LOG_FILES[name]
+        if _is_link_or_junction(path.parent) or _is_link_or_junction(path) or not path.is_file():
+            raise FileNotFoundError(name)
+        st = path.stat()
+        if st.st_nlink > 1 or not path.resolve().is_relative_to(run_dir.resolve()):
+            raise FileNotFoundError(name)
+        with open(path, "rb") as f:
+            start = max(0, st.st_size - max_bytes)
+            f.seek(start)
+            data = f.read(max_bytes)
+        return {
+            "run_id": run_id,
+            "file": name,
+            "size": st.st_size,
+            "truncated": start > 0,
+            "content": data.decode("utf-8", errors="replace"),
+        }
+
     def list_runs(self) -> List[StatusResponse]:
         with self._lock:
             return list(self._runs.values())
@@ -472,6 +506,7 @@ class TaskRunner:
                 run_id=req.run_id,
                 status="starting",
                 branch=req.branch,
+                base_branch=req.base_branch,
                 agent_engine=req.agent_engine,
                 strategy=req.strategy,
                 started_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -698,7 +733,23 @@ class TaskRunner:
         _write_git_exclude(run_dir)
 
         log_wrapper(f"Checking out branch {branch}...")
-        base_ref = _detect_base_ref(run_dir, env)
+        if req.base_branch:
+            base_ref = f"origin/{req.base_branch}"
+            exists = subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/{base_ref}"],
+                cwd=run_dir,
+                capture_output=True,
+                env=env,
+            )
+            if exists.returncode != 0:
+                # Never fall back to the default branch: the master asked for this base.
+                raise RuntimeError(f"Base branch '{req.base_branch}' not found on origin")
+        else:
+            base_ref = _detect_base_ref(run_dir, env)
+        with self._lock:
+            # Report the base actually used, so the master can verify it.
+            self._runs[req.run_id].base_branch = base_ref[len("origin/"):] if base_ref else None
+        log_wrapper(f"Starting from {base_ref or 'an empty repository'}")
         if base_ref:
             checkout_res = subprocess.run(
                 ["git", "checkout", "-B", branch, base_ref],

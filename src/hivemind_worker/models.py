@@ -42,12 +42,8 @@ def validate_repo_url(value: str) -> str:
     return cleaned
 
 
-def validate_branch_name(value: Optional[str]) -> Optional[str]:
-    """Ensure the branch is a valid ref under exp/ that cannot be read as a git flag.
-
-    The worker force-pushes this branch, so anything outside exp/ (main, a release
-    branch) is refused: a rogue or mistaken master must not overwrite real branches.
-    """
+def validate_ref_name(value: Optional[str]) -> Optional[str]:
+    """Ensure a branch name is a valid ref that cannot be read as a git flag."""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -55,8 +51,6 @@ def validate_branch_name(value: Optional[str]) -> Optional[str]:
     cleaned = value.strip()
     if not cleaned:
         return None
-    if not cleaned.startswith("exp/") or len(cleaned) <= len("exp/"):
-        raise ValueError(f"Invalid branch name {value!r}: worker branches must be under 'exp/'")
     if (
         cleaned.startswith("-")
         or cleaned.endswith(("/", ".lock", "."))
@@ -69,6 +63,20 @@ def validate_branch_name(value: Optional[str]) -> Optional[str]:
     return cleaned
 
 
+def validate_branch_name(value: Optional[str]) -> Optional[str]:
+    """Ensure the branch to push is a valid ref under exp/.
+
+    The worker force-pushes this branch, so anything outside exp/ (main, a release
+    branch) is refused: a rogue or mistaken master must not overwrite real branches.
+    """
+    cleaned = validate_ref_name(value)
+    if cleaned is None:
+        return None
+    if not cleaned.startswith("exp/") or len(cleaned) <= len("exp/"):
+        raise ValueError(f"Invalid branch name {value!r}: worker branches must be under 'exp/'")
+    return cleaned
+
+
 class DispatchRequest(BaseModel):
     """Payload sent by HiveMind master to trigger a task run."""
     run_id: str = Field(..., description="Unique identifier for the task run")
@@ -78,6 +86,10 @@ class DispatchRequest(BaseModel):
     strategy_index: int = Field(default=1, ge=1, le=1000, description="1-based index of current strategy")
     strategy_count: int = Field(default=1, ge=1, le=1000, description="Total number of parallel strategies")
     branch: Optional[str] = Field(default=None, description="Target branch to push (e.g. exp/worker-1-strategy)")
+    base_branch: Optional[str] = Field(
+        default=None,
+        description="Branch on origin to start from (default: origin's default branch)",
+    )
     agent_engine: str = Field(default="claude-code", min_length=1, max_length=64, description="AI agent engine (aider, agy, claude-code)")
     model: Optional[str] = Field(default=None, max_length=200, description="Optional model override")
     test_command: Optional[str] = Field(default=None, max_length=4096, description="Verification test command (e.g. 'pytest -q')")
@@ -114,6 +126,12 @@ class DispatchRequest(BaseModel):
     def _check_branch(cls, value: Optional[str]) -> Optional[str]:
         return validate_branch_name(value)
 
+    @field_validator("base_branch")
+    @classmethod
+    def _check_base_branch(cls, value: Optional[str]) -> Optional[str]:
+        # Any valid branch may be a base (main, develop, feature/x); it is only read, never pushed.
+        return validate_ref_name(value)
+
 
 class DispatchResponse(BaseModel):
     """Response returned upon accepting a dispatch job."""
@@ -130,6 +148,10 @@ class StatusResponse(BaseModel):
         description="starting | running | succeeded | failed | no_changes | cancelled | unknown",
     )
     branch: Optional[str] = None
+    base_branch: Optional[str] = Field(
+        default=None,
+        description="Branch the run started from: the requested base_branch, or origin's default once detected",
+    )
     pushed: Optional[bool] = Field(default=None, description="True once the branch is on origin")
     commit: Optional[str] = Field(default=None, description="Commit SHA pushed to the branch")
     agent_engine: Optional[str] = None
@@ -156,6 +178,20 @@ class HealthResponse(BaseModel):
     version: str
     status: str = Field(default="ready", description="ready | busy")
     active_runs: List[str] = Field(default_factory=list)
+    features: List[str] = Field(
+        default_factory=list,
+        description="Optional API features this worker supports (e.g. base_branch, logs); "
+        "masters check it because older workers silently ignore unknown dispatch fields",
+    )
+
+
+class LogResponse(BaseModel):
+    """The end of one of a run's log files."""
+    run_id: str
+    file: str
+    size: int = Field(..., description="Size of the whole log file in bytes")
+    truncated: bool = Field(..., description="True if content is only the end of the file")
+    content: str
 
 
 class CancelResponse(BaseModel):

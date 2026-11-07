@@ -8,6 +8,11 @@ import psutil
 from hivemind_worker import __version__
 from hivemind_worker.models import HealthResponse
 
+# Advertised in /health so masters can refuse to use a feature on a worker that would
+# silently ignore it (unknown dispatch fields are dropped, so an old worker given a
+# base_branch would quietly start from the default branch).
+WORKER_FEATURES = ["base_branch", "logs"]
+
 
 def resolve_binary(name: str, search_path: Optional[str] = None) -> Optional[str]:
     """Locate an executable on PATH or in standard user install locations.
@@ -83,7 +88,8 @@ def get_system_health(active_runs: List[str] = None) -> HealthResponse:
         git_ready=git_ready,
         version=__version__,
         status=status,
-        active_runs=active_runs
+        active_runs=active_runs,
+        features=list(WORKER_FEATURES),
     )
 
 

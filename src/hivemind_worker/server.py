@@ -4,7 +4,9 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from typing import Literal
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -21,6 +23,7 @@ from hivemind_worker.models import (
     DispatchRequest,
     DispatchResponse,
     HealthResponse,
+    LogResponse,
     StatusResponse,
 )
 from hivemind_worker.runner import TaskRunner
@@ -208,6 +211,20 @@ def create_app(
             cancelled=True,
             message=f"Task '{run_id}' successfully cancelled."
         )
+
+    @app.get("/logs/{run_id}", response_model=LogResponse, tags=["Execution"], dependencies=[Depends(verify_auth)])
+    def get_log(
+        run_id: str,
+        file: Literal["agent", "test", "bench", "wrapper"] = "agent",
+        max_bytes: int = Query(default=1024 * 1024, ge=1, le=5 * 1024 * 1024),
+    ):
+        """Return the end of one of a run's logs (up to max_bytes, default 1 MiB, at most 5 MiB)."""
+        try:
+            return runner.read_log(run_id, file, max_bytes)
+        except (KeyError, ValueError):
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' has no {file} log.")
 
     @app.get("/runs", response_model=List[StatusResponse], tags=["Execution"], dependencies=[Depends(verify_auth)])
     def list_all_runs():
