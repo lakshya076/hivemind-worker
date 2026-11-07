@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -67,6 +68,35 @@ def _safe_tail(
         return "\n".join(lines[-max_lines:]).strip()
     except Exception:
         return ""
+
+
+BENCH_OUTPUT_LIMIT = 64 * 1024
+
+
+def _read_bench_output(bench_log_path: Path):
+    """Parse benchmark output as JSON, else keep it as raw text.
+
+    Output over BENCH_OUTPUT_LIMIT is never read whole: it would be held in memory,
+    sent to the master and saved in both run files. Only its tail is kept.
+    """
+    try:
+        if _is_link_or_junction(bench_log_path) or not bench_log_path.is_file():
+            return {"raw_output": ""}
+        size = bench_log_path.stat().st_size
+        if size > BENCH_OUTPUT_LIMIT:
+            tail = _safe_tail(bench_log_path, max_lines=20, max_bytes=4096)
+            return {"raw_output": f"[benchmark output truncated: {size} bytes] {tail}"}
+        raw = bench_log_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {"raw_output": ""}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"raw_output": raw.strip()}
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-") or "strategy"
 
 
 def _build_stripped_env(workspace_dir: Path, *, include_ai_keys: bool = True) -> Dict[str, str]:
@@ -197,7 +227,7 @@ def _resolve_agent_binary(binary_name: str, env: Dict[str, str]) -> Optional[str
 def _write_git_exclude(run_dir: Path) -> None:
     """Write worker ignore patterns to .git/info/exclude so .gitignore is never dirtied."""
     exclude_path = run_dir / ".git" / "info" / "exclude"
-    patterns = [".hive/", ".agy/", "result.json", "__pycache__/", "*.pyc", "*.pyo"]
+    patterns = [".hive/", ".agy/", ".aider*", "result.json", "__pycache__/", "*.pyc", "*.pyo"]
     try:
         if exclude_path.is_symlink():
             exclude_path.unlink()
@@ -755,7 +785,7 @@ class TaskRunner:
 
         env = _build_stripped_env(run_dir, include_ai_keys=False)
         agent_env = _build_stripped_env(run_dir, include_ai_keys=True)
-        branch = req.branch or f"exp/{req.run_id[:12]}-worker-{req.strategy}"
+        branch = req.branch or f"exp/{req.run_id[:12]}-worker-{_slug(req.strategy)}"
 
         hive_meta_dir = run_dir / ".hive"
         wrapper_log_path = hive_meta_dir / "wrapper.log"
@@ -795,12 +825,14 @@ class TaskRunner:
             hive_meta_dir.mkdir(parents=True, exist_ok=True)
             log_wrapper(f"Starting task {req.run_id} (Engine: {req.agent_engine}, Strategy: {req.strategy})")
 
-            # 3. Format Prompt
+            # 3. Format Prompt. It must never start with the task text: aider runs a
+            # message starting with "/" or "!" as a command (e.g. "!curl ... | sh"),
+            # and Claude Code treats a leading "/" as a slash command.
             full_prompt = (
-                f"{req.prompt.rstrip()}\n\n"
                 f"You are pursuing strategy {req.strategy_index} of {req.strategy_count}: {req.strategy}. "
                 "Take a distinct approach.\n"
-                "Change code only. Do not commit, push, or change git remotes.\n"
+                "Change code only. Do not commit, push, or change git remotes.\n\n"
+                f"Task:\n{req.prompt.rstrip()}\n"
             )
             prompt_file.write_text(full_prompt, encoding="utf-8")
 
@@ -929,16 +961,7 @@ class TaskRunner:
 
                 if self._is_cancelled(req.run_id):
                     return
-                raw_bench = ""
-                try:
-                    if not _is_link_or_junction(bench_log_path) and bench_log_path.is_file():
-                        raw_bench = bench_log_path.read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    raw_bench = ""
-                try:
-                    bench_data = json.loads(raw_bench)
-                except Exception:
-                    bench_data = {"raw_output": raw_bench.strip()}
+                bench_data = _read_bench_output(bench_log_path)
                 with self._lock:
                     self._runs[req.run_id].bench_exit_code = bench_exit
                     self._runs[req.run_id].benchmark_data = bench_data

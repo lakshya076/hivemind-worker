@@ -46,6 +46,21 @@ def test_protected_endpoints_require_fleet_key(app, headers, detail):
     assert detail in resp.json()["detail"]
 
 
+def test_non_ascii_token_is_rejected_not_a_server_error(app):
+    # compare_digest raises on non-ASCII str; this used to return 500.
+    client = TestClient(app, base_url="http://10.0.0.2:7422", client=LAN_CLIENT, raise_server_exceptions=False)
+    resp = client.get("/health", headers={"Authorization": "Bearer café".encode("utf-8")})
+    assert resp.status_code == 401
+
+
+def test_dispatch_refuses_branch_outside_exp(app, tmp_path):
+    body = {"run_id": "r1", "repo_url": "https://x/y.git", "prompt": "p", "branch": "main"}
+    resp = client_for(app).post("/dispatch", json=body, headers=AUTH)
+    assert resp.status_code == 422
+    assert "exp/" in resp.text
+    assert not (tmp_path / "ws" / "r1").exists()
+
+
 def test_health_with_key(app):
     resp = client_for(app).get("/health", headers=AUTH)
     assert resp.status_code == 200

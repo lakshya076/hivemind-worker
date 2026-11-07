@@ -41,7 +41,11 @@ def validate_repo_url(value: str) -> str:
 
 
 def validate_branch_name(value: Optional[str]) -> Optional[str]:
-    """Ensure branch name cannot be interpreted as a git flag or invalid ref."""
+    """Ensure the branch is a valid ref under exp/ that cannot be read as a git flag.
+
+    The worker force-pushes this branch, so anything outside exp/ (main, a release
+    branch) is refused: a rogue or mistaken master must not overwrite real branches.
+    """
     if value is None:
         return None
     if not isinstance(value, str):
@@ -49,6 +53,8 @@ def validate_branch_name(value: Optional[str]) -> Optional[str]:
     cleaned = value.strip()
     if not cleaned:
         return None
+    if not cleaned.startswith("exp/") or len(cleaned) <= len("exp/"):
+        raise ValueError(f"Invalid branch name {value!r}: worker branches must be under 'exp/'")
     if (
         cleaned.startswith("-")
         or cleaned.endswith(("/", ".lock", "."))

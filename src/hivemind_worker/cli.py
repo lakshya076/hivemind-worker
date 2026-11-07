@@ -88,7 +88,9 @@ def main(ctx: click.Context, config_path: Optional[Path]):
 
 
 @main.command(name="start")
-@click.option("--key", "-k", default=None, help="Fleet API key for authentication (or set HIVEMIND_FLEET_KEY).")
+# Hidden and deprecated: a key on the command line stays readable in the process list
+# (/proc/<pid>/cmdline) for the daemon's whole lifetime. Kept so existing services still start.
+@click.option("--key", "-k", default=None, hidden=True, help="Deprecated: use `hivemind-worker key set`.")
 @click.option("--port", "-p", default=None, type=int, help="Port to listen on (default: 7422).")
 @click.option("--host", "-h", default=None, help="Host address to bind (default: 0.0.0.0).")
 @click.option("--workspace", "-w", default=None, help="Root folder for task workspaces (default: ~/hive-workspace).")
@@ -115,6 +117,10 @@ def start_cmd(
 
     # Apply overrides
     if key:
+        console.print(
+            "[bold yellow]Warning:[/bold yellow] --key leaves the fleet key visible in the process list "
+            "while the worker runs. Store it with [bold white]hivemind-worker key set[/bold white] and drop --key."
+        )
         config.fleet_key = key
     if port is not None:
         config.port = port

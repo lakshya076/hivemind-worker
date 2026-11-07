@@ -81,7 +81,7 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
 | `DELETE` | `/cancel/{run_id}` | key | Aborts a queued or running task and terminates its process tree |
 | `GET` | `/runs` | key | Lists all historical and active runs |
 
-`/dispatch` rejects invalid payloads with HTTP 422 before anything touches disk: a `run_id` that is not 1–128 characters of `[A-Za-z0-9._-]` (or contains `..`), a `repo_url` or `branch` that could be read as a git option or remote helper, a model name with characters outside `[A-Za-z0-9._:/@+-]` or not starting with a letter or digit, and oversized fields (prompt over 200,000 characters, `repo_url` over 2,048, test or bench command over 4,096).
+`/dispatch` rejects invalid payloads with HTTP 422 before anything touches disk: a `run_id` that is not 1–128 characters of `[A-Za-z0-9._-]` (or contains `..`), a `repo_url` or `branch` that could be read as a git option or remote helper, a `branch` outside `exp/` (the worker force-pushes it, so it must never be `main` or another real branch), a model name with characters outside `[A-Za-z0-9._:/@+-]` or not starting with a letter or digit, and oversized fields (prompt over 200,000 characters, `repo_url` over 2,048, test or bench command over 4,096).
 
 ---
 
@@ -89,13 +89,13 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
 
 1. **Queue.** The run starts as `starting` and waits for one of `max_concurrent_runs` slots. A queued run can be cancelled before it starts.
 2. **Workspace.** The run gets `<workspace_root>/<run_id>/`. The client's `workspace_dir` hint is ignored. Each `repo_url` is cached as a bare mirror in `<workspace_root>/.mirrors/`, so later clones are local and fast; `origin` still points at `repo_url`.
-3. **Branch.** The worker checks out the branch the master sends (`exp/<run_id>/<worker>-<strategy>`) from the remote default branch (`origin/HEAD`, then `origin/main`, then `origin/master`). If the master sends no branch, the worker uses `exp/<first 12 characters of run_id>-worker-<strategy>`. Worker files (`.hive/`, `result.json`, `__pycache__/`) are listed in `.git/info/exclude`, so the repository's `.gitignore` is never changed.
-4. **Agent.** The prompt, plus a line naming the strategy, is written to `.hive/prompt.txt`:
-   - Aider reads it with `--message-file`.
+3. **Branch.** The worker checks out the branch the master sends (`exp/<run_id>/<worker>-<strategy>`) from the remote default branch (`origin/HEAD`, then `origin/main`, then `origin/master`). If the master sends no branch, the worker uses `exp/<first 12 characters of run_id>-worker-<strategy>`. Worker and agent files (`.hive/`, `.agy/`, `.aider*`, `result.json`, `__pycache__/`) are listed in `.git/info/exclude`, so the repository's `.gitignore` is never changed.
+4. **Agent.** `.hive/prompt.txt` gets a fixed header naming the strategy, then `Task:` and the master's prompt. The header means the file never starts with the task text, which matters because aider runs a message starting with `/` or `!` as a command, and Claude Code treats a leading `/` as a slash command.
+   - Aider reads it with `--message-file`. It runs with `--yes-always`, which accepts every routine prompt. So the worker also turns off the prompts it must never accept: self-upgrade via pip (`--no-check-update`), fetching URLs found in the prompt (`--no-detect-urls`), editing `.gitignore` (`--no-gitignore`), and the analytics opt-in (`--no-analytics`).
    - Claude Code reads it from stdin and runs with `--permission-mode acceptEdits`, so it can edit files but not run shell commands.
    - `agy` takes the prompt as an argument, so it must be a native executable. The worker refuses to pass a prompt to a `.cmd`/`.bat` shim.
    - No agent is ever started through a shell. The agent is killed with its whole process tree after `agent_timeout` seconds.
-5. **Tests and benchmark.** `test_command` and `bench_command` run in the workspace and are killed after `test_timeout` seconds. Benchmark output is parsed as JSON; output that is not JSON is kept as `{"raw_output": ...}`.
+5. **Tests and benchmark.** `test_command` and `bench_command` run in the workspace and are killed after `test_timeout` seconds. Benchmark output is parsed as JSON; output that is not JSON is kept as `{"raw_output": ...}`. Output over 64 KiB is not read whole: only its last lines are kept, marked `[benchmark output truncated: <size> bytes]`.
 6. **Commit and push.** Changes are committed as `hive: <strategy> (run <run_id>)` and force-pushed to the branch.
 7. **Result.** The final status is written to `<run_id>/result.json`. Logs stay in `<run_id>/.hive/` (`wrapper.log`, `agent.log`, `test.log`, `bench.log`).
 
@@ -125,7 +125,31 @@ After each run, working trees beyond the newest `max_retained_workspaces` comple
 - **Workspace confinement**: Every run lives in `<workspace_root>/<run_id>/`; the `run_id` is validated so it cannot escape. The worker never follows symlinks, hardlinks or NTFS junctions when reading logs or deleting old workspaces, so a run cannot make it read or delete files outside the workspace.
 - **Git injection protection**: `repo_url` values that start with `-`, use remote helpers (`ext::`, `fd::`), are UNC network shares (`\\server\share`, `//server/share`), or contain whitespace are rejected. Git commands pass `--` before URLs and branch names.
 - **Agent cannot hijack git**: After the agent exits, the worker deletes anything in `.git/hooks/` and restores `.git/config` from a copy taken before the agent ran. Commit and push run with an empty hooks directory, `core.fsmonitor=false` and `--no-verify`.
-- **AI keys go to the agent only**: Subprocesses get a stripped environment: `PATH`, OS essentials, `HOME`, and a git identity, with no other variables (no `SSH_AUTH_SOCK`, cloud credentials, and so on). AI provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`) are read from the environment or `~/.env` and passed **only** to the agent. Tests, benchmarks and git never see them, so agent-written tests cannot leak them.
+- **Stripped environment**: Subprocesses get only `PATH`, OS essentials, `HOME` and a git identity, with no other variables (no `SSH_AUTH_SOCK`, cloud credentials, and so on). AI provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`) are read from the environment or `~/.env` and put in the environment of the agent only, not of tests, benchmarks or git. This keeps them out of environment dumps and test logs. **It is not isolation**; see the trust model below.
+- **Exp branches only**: The worker only pushes branches under `exp/`, so a bad dispatch can never force-push `main`.
+
+### ⚠️ Trust model: tests run agent-written code as the worker's user
+
+`test_command` and `bench_command` run the repository's code *after the agent has edited it*. Anything that influences the agent can therefore run code on the worker: a prompt, or text in the repository the agent reads (prompt injection). That code runs as the worker's OS user, with that user's full file access. It can read:
+
+* the git push key (`~/.ssh/...`), and with it push to every repository that key can reach;
+* the fleet key in `~/.hivemind/worker.json`. It is shared by the whole fleet, so it lets anyone drive **every** worker;
+* AI keys in `~/.env`, and anything else in that user's home.
+
+The stripped environment does not change this, because the code can simply read the files. Until container sandboxing lands (roadmap Phase 4), limit what a compromised run can reach:
+
+1. **Run the worker as a dedicated OS user** (e.g. `hivemind`), never your personal account. Give it its own home, its own `~/.env` with only the AI key it needs, and no personal files.
+2. **Give that user a deploy key** for only the repositories the fleet works on (GitHub: *Settings → Deploy keys → Allow write access*), not a key on your personal account.
+3. **Only dispatch repositories and prompts you trust**, and remember that the agent reads the whole repository.
+
+```bash
+# Debian/Ubuntu example
+sudo useradd --create-home --shell /bin/bash hivemind
+sudo -iu hivemind ssh-keygen -t ed25519 -N "" -f ~hivemind/.ssh/id_ed25519   # add the .pub as a deploy key
+# install hivemind-worker and the agent CLIs as `hivemind`, then use User=hivemind in the systemd unit
+```
+
+Passing the key with `hivemind-worker start --key <KEY>` still works but is deprecated and prints a warning, because the key stays visible in the process list while the worker runs. Use `hivemind-worker key set`.
 
 ---
 

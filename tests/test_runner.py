@@ -105,6 +105,7 @@ def test_git_exclude_is_used_instead_of_gitignore(tmp_path):
     _write_git_exclude(tmp_path)  # idempotent
     exclude = (tmp_path / ".git" / "info" / "exclude").read_text(encoding="utf-8")
     assert exclude.count(".hive/") == 1
+    assert ".aider*" in exclude  # aider's chat history files must never be committed
     assert not (tmp_path / ".gitignore").exists()
 
 
@@ -203,15 +204,16 @@ def wait_for(runner: TaskRunner, run_id: str, statuses=TERMINAL, timeout: float 
 
 
 def dispatch(runner: TaskRunner, origin: Path, run_id: str = "r1", **fields) -> DispatchRequest:
-    req = DispatchRequest(
-        run_id=run_id,
-        repo_url=str(origin),
-        prompt="do the thing",
-        strategy="simd",
-        branch=f"exp/{run_id}/ari-simd",
-        agent_engine="claude-code",
-        **fields,
-    )
+    values = {
+        "run_id": run_id,
+        "repo_url": str(origin),
+        "prompt": "do the thing",
+        "strategy": "simd",
+        "branch": f"exp/{run_id}/ari-simd",
+        "agent_engine": "claude-code",
+    }
+    values.update(fields)
+    req = DispatchRequest(**values)
     runner.dispatch(req)
     return req
 
@@ -290,6 +292,36 @@ def test_benchmark_json_is_captured(tmp_path, origin_repo, fake_agent):
 
     assert st.bench_exit_code == 0
     assert st.benchmark_data == {"ops_per_sec": 1234}
+
+
+@pytest.mark.parametrize("task", ["!echo pwned > pwned.txt", "/run echo pwned", "/init"])
+def test_prompt_never_starts_with_the_task_text(tmp_path, origin_repo, fake_agent, task):
+    # aider runs a message starting with "/" or "!" as a command; Claude Code reads a
+    # leading "/" as a slash command. The task must sit behind a fixed header.
+    fake_agent["mode"] = "noop"
+    runner = TaskRunner(tmp_path / "ws")
+    dispatch(runner, origin_repo, prompt=task)
+    wait_for(runner, "r1")
+
+    prompt = (tmp_path / "ws" / "r1" / ".hive" / "prompt.txt").read_text(encoding="utf-8")
+    assert prompt[0] not in "/!"
+    assert prompt.startswith("You are pursuing strategy 1 of 1: simd.")
+    assert f"Task:\n{task}\n" in prompt
+
+
+def test_huge_benchmark_output_is_not_read_whole(tmp_path, origin_repo, fake_agent):
+    bench = tmp_path / "noisy_bench.py"
+    bench.write_text('import sys\nsys.stdout.write("x" * 300_000)\nprint()\nprint("last line")\n', encoding="utf-8")
+    runner = TaskRunner(tmp_path / "ws")
+    dispatch(runner, origin_repo, bench_command=f'"{sys.executable}" "{bench}"')
+
+    st = wait_for(runner, "r1")
+
+    raw = st.benchmark_data["raw_output"]
+    assert raw.startswith("[benchmark output truncated:")
+    assert raw.endswith("last line")
+    assert len(raw) < 5000
+    assert len((tmp_path / "ws" / "r1" / "result.json").read_bytes()) < 20_000
 
 
 def test_agent_planted_git_hooks_never_run(tmp_path, origin_repo, fake_agent, git):

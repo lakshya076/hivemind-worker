@@ -64,11 +64,24 @@ def test_blank_branch_means_none():
 
 
 @pytest.mark.parametrize(
-    "branch", ["-f", "--force", "a..b", "a//b", "a/", "a.lock", "a.", "a@{1}", "a b", "a~1", "a^"]
+    "branch",
+    ["-f", "--force", "exp/a..b", "exp/a//b", "exp/a/", "exp/a.lock", "exp/a.", "exp/a@{1}", "exp/a b", "exp/a~1", "exp/a^"],
 )
 def test_bad_branch_names_rejected(branch):
     with pytest.raises(ValueError):
         validate_branch_name(branch)
+
+
+@pytest.mark.parametrize("branch", ["main", "master", "release/1.0", "exp", "exp/", "expx/a", "refs/heads/main"])
+def test_branches_outside_exp_are_rejected(branch):
+    # The worker force-pushes the branch, so it must never be main or another real branch.
+    with pytest.raises(ValueError, match="exp/"):
+        validate_branch_name(branch)
+
+
+@pytest.mark.parametrize("branch", ["exp/20261107-120000-abcd1234/ari-simd", "exp/ari-strategy-1"])
+def test_exp_branches_accepted(branch):
+    assert validate_branch_name(branch) == branch
 
 
 def base_request(**overrides):
@@ -88,6 +101,7 @@ def test_dispatch_request_defaults():
         {"run_id": "../escape"},
         {"repo_url": "--upload-pack=x"},
         {"branch": "--force"},
+        {"branch": "main"},
         {"prompt": ""},
         {"prompt": "x" * 200_001},
         {"repo_url": "https://x/" + "a" * 2048},

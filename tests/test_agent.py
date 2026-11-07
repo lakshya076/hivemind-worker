@@ -22,6 +22,16 @@ def test_aider_reads_prompt_from_file():
     assert PROMPT not in cmd.args and not cmd.prompt_in_args
 
 
+@pytest.mark.parametrize(
+    "flag",
+    # With --yes-always aider would otherwise self-upgrade via pip (and exit without
+    # doing the task), fetch URLs from the prompt, edit .gitignore, and opt in to analytics.
+    ["--no-check-update", "--no-detect-urls", "--no-gitignore", "--no-analytics", "--no-show-release-notes"],
+)
+def test_aider_never_auto_accepts_dangerous_prompts(flag):
+    assert flag in build_agent_command("aider", PROMPT_FILE, PROMPT).args
+
+
 @pytest.mark.parametrize("engine", ["claude-code", "claude", " Claude-Code "])
 def test_claude_reads_prompt_from_stdin_and_can_edit(engine):
     cmd = build_agent_command(engine, PROMPT_FILE, PROMPT, model="sonnet")

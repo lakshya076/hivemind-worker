@@ -52,6 +52,10 @@ def build_agent_command(
     model = validate_model(model)
 
     if engine_key == "aider":
+        # --yes-always answers every non-explicit prompt with yes, so turn off the
+        # prompts a worker must never accept: self-upgrade via pip (which also exits
+        # without doing the task), fetching URLs found in the prompt, editing the
+        # repo's .gitignore, and the analytics opt-in.
         return AgentCommand(args=[
             "aider",
             "--model", model or DEFAULT_AIDER_MODEL,
@@ -60,6 +64,11 @@ def build_agent_command(
             "--no-auto-commits",
             "--no-dirty-commits",
             "--no-show-model-warnings",
+            "--no-check-update",
+            "--no-show-release-notes",
+            "--no-detect-urls",
+            "--no-gitignore",
+            "--no-analytics",
         ])
 
     if engine_key in ("claude-code", "claude"):

@@ -156,7 +156,8 @@ def create_app(
             )
 
         token = parts[1]
-        if not secrets.compare_digest(token, fleet_key):
+        # Compare bytes: compare_digest raises TypeError on non-ASCII str, which was a 500.
+        if not secrets.compare_digest(token.encode("utf-8"), fleet_key.encode("utf-8")):
             logger.warning(f"Unauthorized access from [{client_ip}]: Invalid fleet API key supplied")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
