@@ -554,3 +554,36 @@ def test_redispatched_run_clears_stale_hive_logs(tmp_path, origin_repo, fake_age
     with pytest.raises(FileNotFoundError):
         runner.read_log("r-reuse", "test", 1024)
 
+
+def test_redispatched_run_sanitizes_git_hooks_before_checkout(tmp_path, origin_repo, fake_agent):
+    runner = TaskRunner(tmp_path / "ws")
+    dispatch(runner, origin_repo, run_id="r-hook-reuse")
+    assert wait_for(runner, "r-hook-reuse").status == "succeeded"
+
+    # Simulate an interrupted run that left a post-checkout hook and fsmonitor in the reused workspace
+    run_dir = tmp_path / "ws" / "r-hook-reuse"
+    pwned = run_dir / "checkout_pwned.txt"
+    hook = run_dir / ".git" / "hooks" / "post-checkout"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(f"#!/bin/sh\necho pwned > {pwned}\n", encoding="utf-8")
+    with open(run_dir / ".git" / "config", "a", encoding="utf-8") as f:
+        f.write(f"[core]\n\tfsmonitor = echo pwned > {pwned}\n")
+
+    dispatch(runner, origin_repo, run_id="r-hook-reuse")
+    assert wait_for(runner, "r-hook-reuse").status == "succeeded"
+    assert not pwned.exists()
+    assert not hook.exists()
+
+
+def test_get_run_status_returns_isolated_snapshot_when_running(tmp_path):
+    runner = TaskRunner(tmp_path / "ws")
+    run_dir = tmp_path / "ws" / "r-snap"
+    (run_dir / ".hive").mkdir(parents=True)
+    (run_dir / ".hive" / "agent.log").write_text("live output\n", encoding="utf-8")
+    runner._runs["r-snap"] = StatusResponse(run_id="r-snap", status="running")
+
+    st = runner.get_run_status("r-snap")
+    assert st is not None and st.log_tail == "live output"
+    assert runner._runs["r-snap"].log_tail is None
+
+
