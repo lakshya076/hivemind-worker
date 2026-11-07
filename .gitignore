@@ -6,6 +6,5 @@ dist/
 build/
 .pytest_cache/
 
-# Local virtualenv and tests (tests are kept local, not committed)
+# Local virtualenv
 .venv/
-tests/
