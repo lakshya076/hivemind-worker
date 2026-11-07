@@ -90,6 +90,17 @@ def base_request(**overrides):
     return DispatchRequest(**fields)
 
 
+@pytest.mark.parametrize("engine, stored", [("aider", "aider"), (" Claude-Code ", "claude-code"), ("claude", "claude"), ("agy", "agy")])
+def test_dispatch_request_normalizes_supported_engines(engine, stored):
+    assert base_request(agent_engine=engine).agent_engine == stored
+
+
+def test_dispatch_request_ignores_legacy_workspace_dir():
+    # Masters before HiveMind #4 still send it; it must not break dispatch.
+    req = DispatchRequest(run_id="r1", repo_url="https://x/y.git", prompt="p", workspace_dir="/etc")
+    assert not hasattr(req, "workspace_dir")
+
+
 def test_dispatch_request_defaults():
     req = base_request()
     assert (req.agent_engine, req.strategy, req.branch) == ("claude-code", "strategy-1", None)
@@ -102,6 +113,10 @@ def test_dispatch_request_defaults():
         {"repo_url": "--upload-pack=x"},
         {"branch": "--force"},
         {"branch": "main"},
+        {"agent_engine": "cursor"},
+        {"agent_engine": "custom"},
+        {"model": "--dangerously-skip-permissions"},
+        {"model": "gpt 4"},
         {"prompt": ""},
         {"prompt": "x" * 200_001},
         {"repo_url": "https://x/" + "a" * 2048},

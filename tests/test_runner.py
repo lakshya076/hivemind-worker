@@ -9,8 +9,11 @@ import pytest
 from hivemind_worker import runner as runner_mod
 from hivemind_worker.agent import AgentCommand
 from hivemind_worker.models import DispatchRequest, StatusResponse
+import subprocess
+
 from hivemind_worker.runner import (
     TaskRunner,
+    _agent_launch_args,
     _build_stripped_env,
     _safe_tail,
     _sanitize_git_dir,
@@ -322,6 +325,50 @@ def test_huge_benchmark_output_is_not_read_whole(tmp_path, origin_repo, fake_age
     assert raw.endswith("last line")
     assert len(raw) < 5000
     assert len((tmp_path / "ws" / "r1" / "result.json").read_bytes()) < 20_000
+
+
+def test_failed_mirror_refresh_is_never_used(tmp_path, origin_repo):
+    runner = TaskRunner(tmp_path / "ws")
+    env = _build_stripped_env(tmp_path, include_ai_keys=False)
+    assert runner._ensure_mirror(str(origin_repo), env) is not None  # first call clones the mirror
+
+    origin_repo.rename(tmp_path / "origin-gone.git")  # origin unreachable from now on
+
+    # A stale mirror must not be handed out: the agent would silently work on an old base.
+    assert runner._ensure_mirror(str(origin_repo), env) is None
+
+
+def test_run_fails_clearly_when_origin_is_unreachable(tmp_path, origin_repo, fake_agent, git):
+    runner = TaskRunner(tmp_path / "ws")
+    dispatch(runner, origin_repo, run_id="first")
+    assert wait_for(runner, "first").status == "succeeded"
+    origin_repo.rename(tmp_path / "origin-gone.git")
+
+    dispatch(runner, origin_repo, run_id="second")
+    st = wait_for(runner, "second")
+
+    assert st.status == "failed"
+    assert "Git clone failed" in st.error
+    assert st.agent_exit_code is None  # the agent never ran on a stale checkout
+
+
+def test_native_agents_launch_without_a_shell():
+    assert _agent_launch_args("/usr/bin/aider", ["--yes-always"], {}) == ["/usr/bin/aider", "--yes-always"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows .cmd shims")
+@pytest.mark.parametrize("folder", ["plain", "with space", "John Smith (work)"])
+def test_windows_cmd_shim_runs_from_any_path(tmp_path, folder):
+    shim_dir = tmp_path / folder
+    shim_dir.mkdir()
+    shim = shim_dir / "claude.cmd"
+    shim.write_text("@echo off\r\necho SHIM-RAN %*\r\n", encoding="utf-8")
+
+    args = _agent_launch_args(str(shim), ["-p", "--permission-mode", "acceptEdits", "--model", "sonnet"], dict(os.environ))
+    res = subprocess.run(args, capture_output=True, text=True)
+
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == "SHIM-RAN -p --permission-mode acceptEdits --model sonnet"
 
 
 def test_agent_planted_git_hooks_never_run(tmp_path, origin_repo, fake_agent, git):

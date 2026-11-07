@@ -169,6 +169,7 @@ def start_cmd(
         host=config.host,
         port=config.port,
         log_level="info",
+        access_log=False,  # the request-logging middleware already logs every request once
     )
 
 

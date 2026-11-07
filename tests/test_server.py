@@ -61,6 +61,14 @@ def test_dispatch_refuses_branch_outside_exp(app, tmp_path):
     assert not (tmp_path / "ws" / "r1").exists()
 
 
+@pytest.mark.parametrize("field, value", [("agent_engine", "custom"), ("model", "--dangerously-skip-permissions")])
+def test_dispatch_rejects_bad_engine_or_model_before_cloning(app, tmp_path, field, value):
+    body = {"run_id": "r1", "repo_url": "https://x/y.git", "prompt": "p", field: value}
+    resp = client_for(app).post("/dispatch", json=body, headers=AUTH)
+    assert resp.status_code == 422
+    assert not (tmp_path / "ws" / "r1").exists()
+
+
 def test_health_with_key(app):
     resp = client_for(app).get("/health", headers=AUTH)
     assert resp.status_code == 200

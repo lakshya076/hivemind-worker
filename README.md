@@ -81,19 +81,21 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
 | `DELETE` | `/cancel/{run_id}` | key | Aborts a queued or running task and terminates its process tree |
 | `GET` | `/runs` | key | Lists all historical and active runs |
 
-`/dispatch` rejects invalid payloads with HTTP 422 before anything touches disk: a `run_id` that is not 1–128 characters of `[A-Za-z0-9._-]` (or contains `..`), a `repo_url` or `branch` that could be read as a git option or remote helper, a `branch` outside `exp/` (the worker force-pushes it, so it must never be `main` or another real branch), a model name with characters outside `[A-Za-z0-9._:/@+-]` or not starting with a letter or digit, and oversized fields (prompt over 200,000 characters, `repo_url` over 2,048, test or bench command over 4,096).
+`/dispatch` rejects invalid payloads with HTTP 422 before anything touches disk: a `run_id` that is not 1–128 characters of `[A-Za-z0-9._-]` (or contains `..`), a `repo_url` or `branch` that could be read as a git option or remote helper, a `branch` outside `exp/` (the worker force-pushes it, so it must never be `main` or another real branch), an `agent_engine` other than `claude-code`, `claude`, `agy` or `aider`, a model name with characters outside `[A-Za-z0-9._:/@+-]` or not starting with a letter or digit, and oversized fields (prompt over 200,000 characters, `repo_url` over 2,048, test or bench command over 4,096).
 
 ---
 
 ## ⚙️ How a Run Works
 
 1. **Queue.** The run starts as `starting` and waits for one of `max_concurrent_runs` slots. A queued run can be cancelled before it starts.
-2. **Workspace.** The run gets `<workspace_root>/<run_id>/`. The client's `workspace_dir` hint is ignored. Each `repo_url` is cached as a bare mirror in `<workspace_root>/.mirrors/`, so later clones are local and fast; `origin` still points at `repo_url`.
+2. **Workspace.** The run gets `<workspace_root>/<run_id>/`. Each `repo_url` is cached as a bare mirror in `<workspace_root>/.mirrors/`, so later clones are local and fast; `origin` still points at `repo_url`. If refreshing the mirror fails, the worker clones straight from `repo_url`, so it never works on a stale copy. If that fails too, the run fails with git's error before the agent starts.
 3. **Branch.** The worker checks out the branch the master sends (`exp/<run_id>/<worker>-<strategy>`) from the remote default branch (`origin/HEAD`, then `origin/main`, then `origin/master`). If the master sends no branch, the worker uses `exp/<first 12 characters of run_id>-worker-<strategy>`. Worker and agent files (`.hive/`, `.agy/`, `.aider*`, `result.json`, `__pycache__/`) are listed in `.git/info/exclude`, so the repository's `.gitignore` is never changed.
 4. **Agent.** `.hive/prompt.txt` gets a fixed header naming the strategy, then `Task:` and the master's prompt. The header means the file never starts with the task text, which matters because aider runs a message starting with `/` or `!` as a command, and Claude Code treats a leading `/` as a slash command.
    - Aider reads it with `--message-file`. It runs with `--yes-always`, which accepts every routine prompt. So the worker also turns off the prompts it must never accept: self-upgrade via pip (`--no-check-update`), fetching URLs found in the prompt (`--no-detect-urls`), editing `.gitignore` (`--no-gitignore`), and the analytics opt-in (`--no-analytics`).
    - Claude Code reads it from stdin and runs with `--permission-mode acceptEdits`, so it can edit files but not run shell commands.
    - `agy` takes the prompt as an argument, so it must be a native executable. The worker refuses to pass a prompt to a `.cmd`/`.bat` shim.
+   - On Windows, `.cmd` shims (such as npm's `claude.cmd`) are started through `cmd.exe` with the whole command quoted, so install paths with spaces (`C:\Users\John Smith\...`) work.
+   - `/health` and the runner find agent CLIs the same way: `PATH` first, then the usual install folders (`~/.local/bin`, `~/.cargo/bin`, npm's global folder on Windows). The worker never reports an engine it can't start, even when a service runs with a minimal `PATH`.
    - No agent is ever started through a shell. The agent is killed with its whole process tree after `agent_timeout` seconds.
 5. **Tests and benchmark.** `test_command` and `bench_command` run in the workspace and are killed after `test_timeout` seconds. Benchmark output is parsed as JSON; output that is not JSON is kept as `{"raw_output": ...}`. Output over 64 KiB is not read whole: only its last lines are kept, marked `[benchmark output truncated: <size> bytes]`.
 6. **Commit and push.** Changes are committed as `hive: <strategy> (run <run_id>)` and force-pushed to the branch.

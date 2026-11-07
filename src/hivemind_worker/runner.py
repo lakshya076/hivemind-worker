@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 import psutil
 
 from hivemind_worker.agent import build_agent_command
+from hivemind_worker.sysinfo import resolve_binary
 from hivemind_worker.models import (
     DispatchRequest,
     StatusResponse,
@@ -201,27 +202,26 @@ def _kill_proc_tree(proc: subprocess.Popen) -> None:
 
 
 def _resolve_agent_binary(binary_name: str, env: Dict[str, str]) -> Optional[str]:
-    """Locate the agent executable on PATH or standard install locations."""
-    resolved = shutil.which(binary_name, path=env.get("PATH")) or shutil.which(binary_name)
-    if resolved:
-        return resolved
+    """Locate the agent executable (same lookup as /health's engine detection)."""
+    return resolve_binary(binary_name, env.get("PATH"))
 
-    home = Path.home()
-    candidates = [
-        home / ".local" / "bin" / binary_name,
-        home / ".cargo" / "bin" / binary_name,
-        Path("/usr/local/bin") / binary_name,
-        Path("/usr/bin") / binary_name,
-        home / "AppData" / "Local" / "Programs" / binary_name,
-        home / ".local" / "bin" / f"{binary_name}.exe",
-        home / ".local" / "bin" / f"{binary_name}.cmd",
-        home / "AppData" / "Roaming" / "npm" / f"{binary_name}.cmd",
-        home / "AppData" / "Local" / "agy" / "bin" / f"{binary_name}.exe",
-    ]
-    for cand in candidates:
-        if cand.exists():
-            return str(cand)
-    return None
+
+def _agent_launch_args(resolved_bin: str, args: List[str], env: Dict[str, str]):
+    """Command to start an agent without a shell.
+
+    Windows can't execute .cmd/.bat shims (npm's claude.cmd) directly, so they go
+    through cmd.exe. With `cmd /s /c`, cmd strips the first and last quote of the
+    command line, so the whole command must be wrapped in one extra pair of quotes;
+    passing it as a list let subprocess's quoting be stripped and broke any shim
+    path containing a space (C:\\Users\\John Smith\\...). Callers must never put
+    the prompt in ``args`` for a shim.
+    """
+    is_windows = platform.system().lower() == "windows"
+    if is_windows and resolved_bin.lower().endswith((".cmd", ".bat")):
+        comspec = env.get("COMSPEC") or os.environ.get("COMSPEC", "cmd.exe")
+        inner = subprocess.list2cmdline([resolved_bin, *args])
+        return f'{subprocess.list2cmdline([comspec])} /d /s /c "{inner}"'
+    return [resolved_bin, *args]
 
 
 def _write_git_exclude(run_dir: Path) -> None:
@@ -599,13 +599,19 @@ class TaskRunner:
                         shutil.rmtree(mirror_dir, ignore_errors=True)
                         return None
                 else:
-                    subprocess.run(
+                    res = subprocess.run(
                         ["git", "--git-dir", str(mirror_dir), "fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*"],
                         capture_output=True,
                         text=True,
                         env=env,
                         timeout=300,
                     )
+                    if res.returncode != 0:
+                        # Never hand out a stale mirror: the agent would silently work on an
+                        # old base. The caller clones straight from repo_url instead, which
+                        # is either fresh or fails with git's real error.
+                        logger.warning(f"Mirror refresh failed for {repo_url}; cloning directly: {res.stderr.strip()[:200]}")
+                        return None
                 return mirror_dir
             except Exception:
                 return None
@@ -851,12 +857,9 @@ class TaskRunner:
                         f"Refusing to pass prompt on command line to batch shim '{resolved_bin}'; "
                         f"install a native '{binary_name}' executable."
                     )
-                comspec = env.get("COMSPEC") or os.environ.get("COMSPEC", "cmd.exe")
-                exec_args = [comspec, "/d", "/s", "/c", resolved_bin, *cmd.args[1:]]
-            else:
-                exec_args = [resolved_bin, *cmd.args[1:]]
+            exec_args = _agent_launch_args(resolved_bin, cmd.args[1:], env)
 
-            log_wrapper(f"Executing agent command: {exec_args[0]} (engine={req.agent_engine})")
+            log_wrapper(f"Executing agent command: {resolved_bin} (engine={req.agent_engine})")
 
             with self._lock:
                 if req.run_id in self._cancelled:

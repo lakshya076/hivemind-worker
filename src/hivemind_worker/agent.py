@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+SUPPORTED_ENGINES = ("claude-code", "claude", "agy", "aider")  # "claude" is an alias of claude-code
+
 DEFAULT_AIDER_MODEL = "openrouter/openrouter/free"
 DEFAULT_AGY_MODEL = "gemini-3.7-flash-medium"
 

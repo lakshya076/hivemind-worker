@@ -1,36 +1,46 @@
 import os
 import platform
 import shutil
-import subprocess
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional
 import psutil
 
 from hivemind_worker import __version__
 from hivemind_worker.models import HealthResponse
 
 
-def is_tool_installed(name: str) -> bool:
-    """Check if an executable is found on system PATH or standard user bin locations."""
-    if shutil.which(name) is not None:
-        return True
-    
-    # Check common fallback locations
+def resolve_binary(name: str, search_path: Optional[str] = None) -> Optional[str]:
+    """Locate an executable on PATH or in standard user install locations.
+
+    The single lookup used both by /health (engine detection) and by the runner
+    (launching agents), so a worker never reports an engine it can't start or
+    the reverse. Services often run with a minimal PATH, hence the fallbacks.
+    """
+    resolved = shutil.which(name, path=search_path) if search_path else None
+    resolved = resolved or shutil.which(name)
+    if resolved:
+        return resolved
+
     home = Path.home()
-    fallbacks = [
+    candidates = [
         home / ".local" / "bin" / name,
         home / ".cargo" / "bin" / name,
         Path("/usr/local/bin") / name,
         Path("/usr/bin") / name,
-        home / "AppData" / "Local" / "Programs" / name,
     ]
     if platform.system().lower() == "windows":
-        fallbacks.extend([
+        candidates += [
             home / ".local" / "bin" / f"{name}.exe",
             home / ".local" / "bin" / f"{name}.cmd",
+            home / "AppData" / "Roaming" / "npm" / f"{name}.cmd",
             home / "AppData" / "Local" / "agy" / "bin" / f"{name}.exe",
-        ])
-    return any(p.exists() for p in fallbacks)
+            home / "AppData" / "Local" / "Programs" / name / f"{name}.exe",
+        ]
+    return next((str(c) for c in candidates if c.is_file()), None)
+
+
+def is_tool_installed(name: str) -> bool:
+    return resolve_binary(name) is not None
 
 
 def detect_installed_engines() -> List[str]:

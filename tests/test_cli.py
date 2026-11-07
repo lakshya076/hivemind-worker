@@ -46,3 +46,15 @@ def test_start_with_saved_key_does_not_warn(tmp_path, started):
     result = CliRunner().invoke(main, ["--config", str(path), "start"])
     assert result.exit_code == 0, result.output
     assert "process list" not in result.output
+
+
+def test_requests_are_logged_once(tmp_path, started):
+    # The middleware logs every request; uvicorn's access log would log each one again.
+    path = config_file(tmp_path, fleet_key="hive-key-saved")
+    CliRunner().invoke(main, ["--config", str(path), "start"])
+    assert started["access_log"] is False
+
+
+def test_version_reports_0_2_0():
+    result = CliRunner().invoke(main, ["--version"])
+    assert "0.2.0" in result.output

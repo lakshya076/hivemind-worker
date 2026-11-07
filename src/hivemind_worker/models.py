@@ -2,6 +2,8 @@ import re
 from typing import Any, List, Optional
 from pydantic import BaseModel, Field, field_validator
 
+from hivemind_worker.agent import SUPPORTED_ENGINES, validate_model
+
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
 _FORBIDDEN_URL_PREFIXES = ("ext::", "fd::")
@@ -80,11 +82,22 @@ class DispatchRequest(BaseModel):
     model: Optional[str] = Field(default=None, max_length=200, description="Optional model override")
     test_command: Optional[str] = Field(default=None, max_length=4096, description="Verification test command (e.g. 'pytest -q')")
     bench_command: Optional[str] = Field(default=None, max_length=4096, description="Benchmark command producing JSON metrics")
-    workspace_dir: Optional[str] = Field(
-        default=None,
-        max_length=1024,
-        description="Deprecated/ignored client hint; runs are always confined to the worker's workspace_root",
-    )
+    # No workspace_dir: runs are always confined to the worker's workspace_root. Older
+    # masters that still send it are fine, because unknown fields are ignored.
+
+    @field_validator("agent_engine")
+    @classmethod
+    def _check_engine(cls, value: str) -> str:
+        # Fail at /dispatch (422) instead of after cloning the repository.
+        engine = value.strip().lower()
+        if engine not in SUPPORTED_ENGINES:
+            raise ValueError(f"Unsupported agent engine {value!r}: supported are {', '.join(SUPPORTED_ENGINES)}")
+        return engine
+
+    @field_validator("model")
+    @classmethod
+    def _check_model(cls, value: Optional[str]) -> Optional[str]:
+        return validate_model(value)
 
     @field_validator("run_id")
     @classmethod
