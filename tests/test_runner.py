@@ -587,3 +587,31 @@ def test_get_run_status_returns_isolated_snapshot_when_running(tmp_path):
     assert runner._runs["r-snap"].log_tail is None
 
 
+def test_persist_result_and_load_refuse_hardlinks_to_external_files(tmp_path):
+    ws = tmp_path / "ws"
+    runner = TaskRunner(ws)
+    secret = tmp_path / "worker.json"
+    secret.write_text('{"fleet_key": "do-not-overwrite"}', encoding="utf-8")
+
+    run_dir = ws / "r-link"
+    run_dir.mkdir(parents=True)
+    os.link(secret, run_dir / "result.json")
+
+    runner._runs["r-link"] = StatusResponse(run_id="r-link", status="succeeded")
+    runner._persist_result("r-link")
+
+    # External file must not be overwritten through the planted hardlink
+    assert secret.read_text(encoding="utf-8") == '{"fleet_key": "do-not-overwrite"}'
+    assert json.loads((run_dir / "result.json").read_text(encoding="utf-8"))["status"] == "succeeded"
+
+    # And _load_persisted_runs skips hardlinked result.json files
+    run_dir2 = ws / "r-link-load"
+    run_dir2.mkdir(parents=True)
+    fake_result = tmp_path / "fake_result.json"
+    fake_result.write_text(StatusResponse(run_id="r-link-load", status="running").model_dump_json(), encoding="utf-8")
+    os.link(fake_result, run_dir2 / "result.json")
+    runner2 = TaskRunner(ws)
+    assert runner2.get_run_status("r-link-load") is None
+
+
+

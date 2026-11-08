@@ -403,28 +403,30 @@ class TaskRunner:
 
     def _load_persisted_runs(self):
         """Scan workspace root for previously saved run results."""
-        if not self.workspace_root.exists():
+        if not self.workspace_root.exists() or _is_link_or_junction(self.workspace_root):
             return
         for run_dir in self.workspace_root.iterdir():
-            if not run_dir.is_dir() or run_dir.name.startswith("."):
+            if _is_link_or_junction(run_dir) or not run_dir.is_dir() or run_dir.name.startswith("."):
                 continue
             result_file = run_dir / "result.json"
-            if result_file.exists():
-                try:
-                    with open(result_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    st = StatusResponse.model_validate(data)
-                    if st.status in ("starting", "running"):
-                        st.status = "failed"
-                        st.error = st.error or "Worker restarted while task was in progress."
-                        st.finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                        try:
-                            result_file.write_text(st.model_dump_json(indent=2), encoding="utf-8")
-                        except Exception:
-                            pass
+            if _is_link_or_junction(result_file) or not result_file.is_file():
+                continue
+            try:
+                if result_file.stat().st_nlink > 1:
+                    continue
+                with open(result_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                st = StatusResponse.model_validate(data)
+                if st.status in ("starting", "running"):
+                    st.status = "failed"
+                    st.error = st.error or "Worker restarted while task was in progress."
+                    st.finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     self._runs[st.run_id] = st
-                except Exception:
-                    pass
+                    self._persist_result(st.run_id)
+                else:
+                    self._runs[st.run_id] = st
+            except Exception:
+                pass
 
     def get_run_status(self, run_id: str) -> Optional[StatusResponse]:
         try:
@@ -563,10 +565,15 @@ class TaskRunner:
             run_dir = self._run_dir_for(run_id)
         except ValueError:
             return
+        if _is_link_or_junction(run_dir):
+            return
         run_dir.mkdir(parents=True, exist_ok=True)
         res_file = run_dir / "result.json"
         try:
-            with open(res_file, "w", encoding="utf-8") as f:
+            if _is_link_or_junction(res_file) or (res_file.exists() and res_file.stat().st_nlink > 1):
+                self._remove_entry_readonly_safe(res_file)
+            fd = os.open(res_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(st.model_dump_json(indent=2))
         except Exception:
             pass
@@ -641,6 +648,13 @@ class TaskRunner:
                 pass
             if removed_any:
                 pruned_runs += 1
+
+        max_in_memory = max(200, keep_count * 10)
+        if len(completed) > max_in_memory:
+            with self._lock:
+                for stale_run in completed[max_in_memory:]:
+                    if stale_run.status in terminal_statuses:
+                        self._runs.pop(stale_run.run_id, None)
         return pruned_runs
 
     def _run_git_cmd(
@@ -697,14 +711,18 @@ class TaskRunner:
     def _ensure_mirror(self, repo_url: str, env: Dict[str, str]) -> Optional[Path]:
         """Create or update a local bare mirror for repo_url so clones stay local and fast."""
         repo_url = validate_repo_url(repo_url)
-        digest = hashlib.sha256(repo_url.encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha256(repo_url.encode("utf-8")).hexdigest()[:32]
         mirror_dir = self.mirrors_root / f"{digest}.git"
         lock = self._get_mirror_lock(digest)
         safe_git = self._safe_git_prefix()
 
         with lock:
             try:
+                if _is_link_or_junction(self.mirrors_root):
+                    self._remove_entry_readonly_safe(self.mirrors_root)
                 self.mirrors_root.mkdir(parents=True, exist_ok=True)
+                if _is_link_or_junction(mirror_dir):
+                    self._remove_entry_readonly_safe(mirror_dir)
                 if not (mirror_dir / "HEAD").exists():
                     if mirror_dir.exists():
                         shutil.rmtree(mirror_dir, ignore_errors=True)
@@ -962,6 +980,8 @@ class TaskRunner:
             git_config_snapshot = git_config_path.read_bytes() if git_config_path.exists() else None
 
             # 2. Setup run directory metadata files
+            if _is_link_or_junction(hive_meta_dir):
+                self._remove_entry_readonly_safe(hive_meta_dir)
             hive_meta_dir.mkdir(parents=True, exist_ok=True)
             log_wrapper(f"Starting task {req.run_id} (Engine: {req.agent_engine}, Strategy: {req.strategy})")
 
@@ -974,6 +994,8 @@ class TaskRunner:
                 "Change code only. Do not commit, push, or change git remotes.\n\n"
                 f"Task:\n{req.prompt.rstrip()}\n"
             )
+            if _is_link_or_junction(prompt_file) or (prompt_file.exists() and prompt_file.stat().st_nlink > 1):
+                self._remove_entry_readonly_safe(prompt_file)
             prompt_file.write_text(full_prompt, encoding="utf-8")
 
             # 4. Build Agent Command (never uses shell=True)
