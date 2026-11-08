@@ -504,3 +504,53 @@ def test_concurrency_limit_queues_and_queued_run_can_be_cancelled(tmp_path, orig
     assert runner.cancel_run("second") is True
     assert runner.cancel_run("first") is True
     assert runner.get_run_status("second").status == "cancelled"
+
+
+def test_read_bench_output_refuses_hardlinks_and_outside_root(tmp_path):
+    from hivemind_worker.runner import _read_bench_output
+
+    secret = tmp_path / "worker.json"
+    secret.write_text('{"fleet_key": "secret"}', encoding="utf-8")
+    run_dir = tmp_path / "run"
+    hive = run_dir / ".hive"
+    hive.mkdir(parents=True)
+    bench_log = hive / "bench.log"
+    os.link(secret, bench_log)
+
+    assert _read_bench_output(bench_log, root_dir=run_dir) == {"raw_output": ""}
+    assert _read_bench_output(secret, root_dir=run_dir) == {"raw_output": ""}
+
+
+def test_sanitize_git_dir_rejects_missing_or_linked_git_dir_after_agent(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    with pytest.raises(RuntimeError, match="removed or corrupted"):
+        _sanitize_git_dir(run_dir, b"[core]\n\tbare = false\n")
+
+
+def test_git_cmd_timeout_terminates_process(tmp_path):
+    runner = TaskRunner(tmp_path / "ws", git_timeout=0.5)
+    with pytest.raises(RuntimeError, match="Git operation timed out"):
+        runner._run_git_cmd(
+            "r-timeout",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=tmp_path,
+            env=dict(os.environ),
+        )
+    assert "r-timeout" not in runner._active_procs
+
+
+def test_redispatched_run_clears_stale_hive_logs(tmp_path, origin_repo, fake_agent):
+    runner = TaskRunner(tmp_path / "ws")
+    dispatch(runner, origin_repo, run_id="r-reuse", test_command=f'"{sys.executable}" -c "print(\'old-test-log\')"')
+    st1 = wait_for(runner, "r-reuse")
+    assert st1.status == "succeeded"
+    assert runner.read_log("r-reuse", "test", 1024)["content"].strip() == "old-test-log"
+
+    # Re-dispatch same run_id without a test_command: old test.log must not survive
+    dispatch(runner, origin_repo, run_id="r-reuse", test_command=None)
+    st2 = wait_for(runner, "r-reuse")
+    assert st2.status == "succeeded"
+    with pytest.raises(FileNotFoundError):
+        runner.read_log("r-reuse", "test", 1024)
+

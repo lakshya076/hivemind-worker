@@ -77,18 +77,29 @@ BENCH_OUTPUT_LIMIT = 64 * 1024
 LOG_FILES = {"agent": "agent.log", "test": "test.log", "bench": "bench.log", "wrapper": "wrapper.log"}
 
 
-def _read_bench_output(bench_log_path: Path):
+def _read_bench_output(bench_log_path: Path, *, root_dir: Optional[Path] = None):
     """Parse benchmark output as JSON, else keep it as raw text.
 
     Output over BENCH_OUTPUT_LIMIT is never read whole: it would be held in memory,
     sent to the master and saved in both run files. Only its tail is kept.
+    Refuses symlinks, NTFS junctions, hardlinks, and paths escaping root_dir.
     """
     try:
-        if _is_link_or_junction(bench_log_path) or not bench_log_path.is_file():
+        if (
+            _is_link_or_junction(bench_log_path)
+            or _is_link_or_junction(bench_log_path.parent)
+            or not bench_log_path.exists()
+            or not bench_log_path.is_file()
+        ):
             return {"raw_output": ""}
-        size = bench_log_path.stat().st_size
+        if root_dir is not None and not bench_log_path.resolve().is_relative_to(root_dir.resolve()):
+            return {"raw_output": ""}
+        st = bench_log_path.stat()
+        if st.st_nlink > 1:
+            return {"raw_output": ""}
+        size = st.st_size
         if size > BENCH_OUTPUT_LIMIT:
-            tail = _safe_tail(bench_log_path, max_lines=20, max_bytes=4096)
+            tail = _safe_tail(bench_log_path, max_lines=20, max_bytes=4096, root_dir=root_dir)
             return {"raw_output": f"[benchmark output truncated: {size} bytes] {tail}"}
         raw = bench_log_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
@@ -229,11 +240,16 @@ def _agent_launch_args(resolved_bin: str, args: List[str], env: Dict[str, str]):
 
 def _write_git_exclude(run_dir: Path) -> None:
     """Write worker ignore patterns to .git/info/exclude so .gitignore is never dirtied."""
-    exclude_path = run_dir / ".git" / "info" / "exclude"
+    git_dir = run_dir / ".git"
+    if _is_link_or_junction(git_dir) or not git_dir.is_dir():
+        return
+    exclude_path = git_dir / "info" / "exclude"
     patterns = [".hive/", ".agy/", ".aider*", "result.json", "__pycache__/", "*.pyc", "*.pyo"]
     try:
-        if exclude_path.is_symlink():
-            exclude_path.unlink()
+        if _is_link_or_junction(exclude_path.parent):
+            TaskRunner._remove_entry_readonly_safe(exclude_path.parent)
+        if _is_link_or_junction(exclude_path):
+            TaskRunner._remove_entry_readonly_safe(exclude_path)
         exclude_path.parent.mkdir(parents=True, exist_ok=True)
         existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
         existing_lines = {line.strip() for line in existing.splitlines()}
@@ -250,31 +266,32 @@ def _sanitize_git_dir(run_dir: Path, config_snapshot: Optional[bytes] = None) ->
     """Neutralize .git/hooks and restore .git/config so an agent with file-edit access
     cannot execute shell commands via pre-commit/pre-push hooks or core.fsmonitor/sshCommand."""
     git_dir = run_dir / ".git"
-    if not git_dir.exists() or git_dir.is_symlink():
+    if _is_link_or_junction(git_dir):
+        TaskRunner._remove_entry_readonly_safe(git_dir)
+        if config_snapshot is not None:
+            raise RuntimeError("Repository .git directory was replaced with a symlink or junction by the agent.")
+        return
+    if not git_dir.exists() or not git_dir.is_dir():
+        if config_snapshot is not None:
+            raise RuntimeError("Repository .git directory was removed or corrupted by the agent.")
         return
 
     if config_snapshot is not None:
         cfg_file = git_dir / "config"
         try:
-            if cfg_file.is_symlink():
-                cfg_file.unlink()
+            if _is_link_or_junction(cfg_file):
+                TaskRunner._remove_entry_readonly_safe(cfg_file)
             cfg_file.write_bytes(config_snapshot)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(f"Failed to restore .git/config snapshot: {exc}") from exc
 
     hooks_dir = git_dir / "hooks"
     try:
-        if hooks_dir.is_symlink() or (hooks_dir.exists() and not hooks_dir.is_dir()):
-            hooks_dir.unlink()
+        if _is_link_or_junction(hooks_dir) or (hooks_dir.exists() and not hooks_dir.is_dir()):
+            TaskRunner._remove_entry_readonly_safe(hooks_dir)
         if hooks_dir.exists():
             for entry in list(hooks_dir.iterdir()):
-                if entry.is_dir() and not entry.is_symlink():
-                    shutil.rmtree(entry, ignore_errors=True)
-                else:
-                    try:
-                        entry.unlink()
-                    except Exception:
-                        pass
+                TaskRunner._remove_entry_readonly_safe(entry)
         else:
             hooks_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -343,6 +360,7 @@ class TaskRunner:
         *,
         agent_timeout: float = 1800.0,
         test_timeout: float = 300.0,
+        git_timeout: float = 300.0,
         max_concurrent_runs: int = 2,
         max_retained_workspaces: int = 20,
     ):
@@ -353,11 +371,13 @@ class TaskRunner:
         self.empty_hooks_dir.mkdir(parents=True, exist_ok=True)
         self.agent_timeout = agent_timeout
         self.test_timeout = test_timeout
+        self.git_timeout = git_timeout
         self.max_concurrent_runs = max(1, int(max_concurrent_runs))
         self.max_retained_workspaces = max(0, int(max_retained_workspaces))
         self._run_slots = threading.Semaphore(self.max_concurrent_runs)
         self._runs: Dict[str, StatusResponse] = {}
         self._active_procs: Dict[str, subprocess.Popen] = {}
+        self._active_threads: Dict[str, threading.Thread] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.Lock()
         self._mirror_locks_guard = threading.Lock()
@@ -418,7 +438,7 @@ class TaskRunner:
             agent_log = run_dir / ".hive" / "agent.log" if (run_dir / ".hive" / "agent.log").exists() else (run_dir / "agent.log")
             wrapper_log = run_dir / ".hive" / "wrapper.log" if (run_dir / ".hive" / "wrapper.log").exists() else (run_dir / "wrapper.log")
             if st.status in ("starting", "running"):
-                st.log_tail = _safe_tail(agent_log) or _safe_tail(wrapper_log)
+                st.log_tail = _safe_tail(agent_log, root_dir=run_dir) or _safe_tail(wrapper_log, root_dir=run_dir)
             return st
 
     def read_log(self, run_id: str, name: str, max_bytes: int) -> Dict[str, object]:
@@ -497,6 +517,15 @@ class TaskRunner:
         self._run_dir_for(req.run_id)
         validate_repo_url(req.repo_url)
         validate_branch_name(req.branch)
+        prev_thread: Optional[threading.Thread] = None
+        with self._lock:
+            if req.run_id in self._runs and self._runs[req.run_id].status in ("starting", "running"):
+                return self._runs[req.run_id]
+            prev_thread = self._active_threads.get(req.run_id)
+
+        if prev_thread is not None and prev_thread.is_alive():
+            prev_thread.join(timeout=5.0)
+
         with self._lock:
             if req.run_id in self._runs and self._runs[req.run_id].status in ("starting", "running"):
                 return self._runs[req.run_id]
@@ -514,11 +543,12 @@ class TaskRunner:
             self._runs[req.run_id] = status
             self._persist_result(req.run_id)
 
-        thread = threading.Thread(
-            target=self._run_task_worker,
-            args=(req,),
-            daemon=True,
-        )
+            thread = threading.Thread(
+                target=self._run_task_worker,
+                args=(req,),
+                daemon=True,
+            )
+            self._active_threads[req.run_id] = thread
         thread.start()
         return status
 
@@ -610,6 +640,48 @@ class TaskRunner:
                 pruned_runs += 1
         return pruned_runs
 
+    def _run_git_cmd(
+        self,
+        run_id: str,
+        args: List[str],
+        *,
+        cwd: Path,
+        env: Dict[str, str],
+        timeout: Optional[float] = None,
+    ) -> subprocess.CompletedProcess:
+        """Run a git subprocess with a bounded timeout and cancellation tracking."""
+        effective_timeout = self.git_timeout if timeout is None else timeout
+        proc = subprocess.Popen(
+            args,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        with self._lock:
+            if run_id in self._cancelled:
+                _kill_proc_tree(proc)
+                return subprocess.CompletedProcess(args, -1, "", "Task was cancelled by master.")
+            self._active_procs[run_id] = proc
+        try:
+            stdout, stderr = proc.communicate(timeout=effective_timeout)
+            return subprocess.CompletedProcess(args, proc.returncode, stdout or "", stderr or "")
+        except subprocess.TimeoutExpired as exc:
+            with self._lock:
+                self._active_procs.pop(run_id, None)
+            _kill_proc_tree(proc)
+            try:
+                proc.communicate(timeout=2.0)
+            except Exception:
+                pass
+            raise RuntimeError(f"Git operation timed out after {int(effective_timeout)}s") from exc
+        finally:
+            with self._lock:
+                if self._active_procs.get(run_id) is proc:
+                    self._active_procs.pop(run_id, None)
+
     def _ensure_mirror(self, repo_url: str, env: Dict[str, str]) -> Optional[Path]:
         """Create or update a local bare mirror for repo_url so clones stay local and fast."""
         repo_url = validate_repo_url(repo_url)
@@ -628,7 +700,7 @@ class TaskRunner:
                         capture_output=True,
                         text=True,
                         env=env,
-                        timeout=300,
+                        timeout=self.git_timeout,
                     )
                     if res.returncode != 0:
                         shutil.rmtree(mirror_dir, ignore_errors=True)
@@ -639,7 +711,7 @@ class TaskRunner:
                         capture_output=True,
                         text=True,
                         env=env,
-                        timeout=300,
+                        timeout=self.git_timeout,
                     )
                     if res.returncode != 0:
                         # Never hand out a stale mirror: the agent would silently work on an
@@ -663,8 +735,12 @@ class TaskRunner:
         repo_url = validate_repo_url(req.repo_url)
         branch = validate_branch_name(branch) or f"exp/{req.run_id[:12]}-worker"
         git_dir = run_dir / ".git"
+        if _is_link_or_junction(git_dir):
+            self._remove_entry_readonly_safe(git_dir)
         if not git_dir.exists():
             mirror_dir = self._ensure_mirror(repo_url, env)
+            if self._is_cancelled(req.run_id):
+                return None
             # Clear any non-git metadata files before git clone into run_dir
             existing_items = list(run_dir.iterdir())
             saved_files: Dict[str, bytes] = {}
@@ -683,11 +759,10 @@ class TaskRunner:
 
             try:
                 if mirror_dir is not None:
-                    clone_res = subprocess.run(
+                    clone_res = self._run_git_cmd(
+                        req.run_id,
                         ["git", "clone", "--", str(mirror_dir), "."],
                         cwd=run_dir,
-                        capture_output=True,
-                        text=True,
                         env=env,
                     )
                     if clone_res.returncode == 0:
@@ -699,13 +774,14 @@ class TaskRunner:
                             env=env,
                         )
                 else:
-                    clone_res = subprocess.run(
+                    clone_res = self._run_git_cmd(
+                        req.run_id,
                         ["git", "clone", "--", repo_url, "."],
                         cwd=run_dir,
-                        capture_output=True,
-                        text=True,
                         env=env,
                     )
+                if self._is_cancelled(req.run_id):
+                    return None
                 if clone_res.returncode != 0:
                     raise RuntimeError(f"Git clone failed: {(clone_res.stderr or clone_res.stdout).strip()}")
             finally:
@@ -714,19 +790,24 @@ class TaskRunner:
                     if not target.exists():
                         target.write_bytes(content)
         else:
+            # Re-using an existing workspace: remove stale .hive logs from any previous run
+            hive_dir = run_dir / ".hive"
+            if _is_link_or_junction(hive_dir) or hive_dir.exists():
+                self._remove_entry_readonly_safe(hive_dir)
             subprocess.run(
                 ["git", "remote", "set-url", "origin", "--", repo_url],
                 cwd=run_dir,
                 capture_output=True,
                 env=env,
             )
-            fetch_res = subprocess.run(
+            fetch_res = self._run_git_cmd(
+                req.run_id,
                 ["git", "fetch", "--prune", "origin"],
                 cwd=run_dir,
-                capture_output=True,
-                text=True,
                 env=env,
             )
+            if self._is_cancelled(req.run_id):
+                return None
             if fetch_res.returncode != 0:
                 raise RuntimeError(f"Git fetch failed: {(fetch_res.stderr or fetch_res.stdout).strip()}")
 
@@ -790,8 +871,13 @@ class TaskRunner:
         """Spawn a subprocess tracked in _active_procs with timeout and cancellation support."""
         stdin_fh = open(stdin_file, "rb") if stdin_file is not None else None
         try:
+            if _is_link_or_junction(stdout_path.parent):
+                self._remove_entry_readonly_safe(stdout_path.parent)
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
             if _is_link_or_junction(stdout_path) or stdout_path.exists():
                 self._remove_entry_readonly_safe(stdout_path)
+            if not stdout_path.parent.resolve().is_relative_to(cwd.resolve()):
+                raise RuntimeError(f"Refusing to write log outside workspace: {stdout_path}")
             with open(stdout_path, "w", encoding="utf-8") as out_fh:
                 proc = subprocess.Popen(
                     args,
@@ -854,7 +940,13 @@ class TaskRunner:
         def log_wrapper(msg: str):
             logger.info(f"[{req.run_id}] {msg}")
             try:
+                if _is_link_or_junction(hive_meta_dir):
+                    self._remove_entry_readonly_safe(hive_meta_dir)
                 hive_meta_dir.mkdir(parents=True, exist_ok=True)
+                if _is_link_or_junction(wrapper_log_path) or (wrapper_log_path.exists() and wrapper_log_path.stat().st_nlink > 1):
+                    self._remove_entry_readonly_safe(wrapper_log_path)
+                if not hive_meta_dir.resolve().is_relative_to(run_dir.resolve()):
+                    return
                 with open(wrapper_log_path, "a", encoding="utf-8") as f:
                     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     f.write(f"[{ts}] {msg}\n")
@@ -937,7 +1029,7 @@ class TaskRunner:
                     if req.run_id not in self._cancelled:
                         self._runs[req.run_id].status = "failed"
                         self._runs[req.run_id].error = f"Agent timed out after {int(self.agent_timeout)}s"
-                        self._runs[req.run_id].log_tail = _safe_tail(agent_log_path) or _safe_tail(wrapper_log_path)
+                        self._runs[req.run_id].log_tail = _safe_tail(agent_log_path, root_dir=run_dir) or _safe_tail(wrapper_log_path, root_dir=run_dir)
                         self._runs[req.run_id].finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 return
 
@@ -975,7 +1067,7 @@ class TaskRunner:
                         if req.run_id not in self._cancelled:
                             self._runs[req.run_id].status = "failed"
                             self._runs[req.run_id].error = f"Test command timed out after {int(self.test_timeout)}s"
-                            self._runs[req.run_id].log_tail = _safe_tail(test_log_path) or _safe_tail(agent_log_path)
+                            self._runs[req.run_id].log_tail = _safe_tail(test_log_path, root_dir=run_dir) or _safe_tail(agent_log_path, root_dir=run_dir)
                             self._runs[req.run_id].finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     return
 
@@ -1009,13 +1101,13 @@ class TaskRunner:
                         if req.run_id not in self._cancelled:
                             self._runs[req.run_id].status = "failed"
                             self._runs[req.run_id].error = f"Benchmark command timed out after {int(self.test_timeout)}s"
-                            self._runs[req.run_id].log_tail = _safe_tail(bench_log_path) or _safe_tail(agent_log_path)
+                            self._runs[req.run_id].log_tail = _safe_tail(bench_log_path, root_dir=run_dir) or _safe_tail(agent_log_path, root_dir=run_dir)
                             self._runs[req.run_id].finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     return
 
                 if self._is_cancelled(req.run_id):
                     return
-                bench_data = _read_bench_output(bench_log_path)
+                bench_data = _read_bench_output(bench_log_path, root_dir=run_dir)
                 with self._lock:
                     self._runs[req.run_id].bench_exit_code = bench_exit
                     self._runs[req.run_id].benchmark_data = bench_data
@@ -1063,13 +1155,14 @@ class TaskRunner:
 
             if has_changes:
                 log_wrapper(f"Pushing branch {branch} to origin...")
-                push_res = subprocess.run(
+                push_res = self._run_git_cmd(
+                    req.run_id,
                     [*safe_git, "push", "--no-verify", "-u", "--force", "origin", "--", branch],
                     cwd=run_dir,
-                    capture_output=True,
-                    text=True,
                     env=env,
                 )
+                if self._is_cancelled(req.run_id):
+                    return
                 if push_res.returncode == 0:
                     pushed = True
                     commit_sha = current_head
@@ -1081,9 +1174,9 @@ class TaskRunner:
 
             # 9. Determine Final Status
             if test_exit is not None and test_exit != 0:
-                tail = _safe_tail(test_log_path) or _safe_tail(agent_log_path) or _safe_tail(wrapper_log_path)
+                tail = _safe_tail(test_log_path, root_dir=run_dir) or _safe_tail(agent_log_path, root_dir=run_dir) or _safe_tail(wrapper_log_path, root_dir=run_dir)
             else:
-                tail = _safe_tail(agent_log_path) or _safe_tail(wrapper_log_path)
+                tail = _safe_tail(agent_log_path, root_dir=run_dir) or _safe_tail(wrapper_log_path, root_dir=run_dir)
 
             if agent_exit != 0:
                 final_status = "failed"
@@ -1121,9 +1214,12 @@ class TaskRunner:
                     st = self._runs[req.run_id]
                     st.status = "failed"
                     st.error = str(exc)
-                    st.log_tail = _safe_tail(agent_log_path) or _safe_tail(wrapper_log_path)
+                    st.log_tail = _safe_tail(agent_log_path, root_dir=run_dir) or _safe_tail(wrapper_log_path, root_dir=run_dir)
                     st.finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         finally:
+            with self._lock:
+                if self._active_threads.get(req.run_id) is threading.current_thread():
+                    self._active_threads.pop(req.run_id, None)
             if slot_acquired:
                 self._run_slots.release()
             self._persist_result(req.run_id)

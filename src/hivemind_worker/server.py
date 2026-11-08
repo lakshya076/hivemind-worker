@@ -61,6 +61,7 @@ def create_app(
         workspace_root,
         agent_timeout=app_config.agent_timeout,
         test_timeout=app_config.test_timeout,
+        git_timeout=app_config.git_timeout,
         max_concurrent_runs=app_config.max_concurrent_runs,
         max_retained_workspaces=app_config.max_retained_workspaces,
     )
