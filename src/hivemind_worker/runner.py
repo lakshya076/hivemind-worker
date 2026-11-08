@@ -403,28 +403,30 @@ class TaskRunner:
 
     def _load_persisted_runs(self):
         """Scan workspace root for previously saved run results."""
-        if not self.workspace_root.exists():
+        if not self.workspace_root.exists() or _is_link_or_junction(self.workspace_root):
             return
         for run_dir in self.workspace_root.iterdir():
-            if not run_dir.is_dir() or run_dir.name.startswith("."):
+            if _is_link_or_junction(run_dir) or not run_dir.is_dir() or run_dir.name.startswith("."):
                 continue
             result_file = run_dir / "result.json"
-            if result_file.exists():
-                try:
-                    with open(result_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    st = StatusResponse.model_validate(data)
-                    if st.status in ("starting", "running"):
-                        st.status = "failed"
-                        st.error = st.error or "Worker restarted while task was in progress."
-                        st.finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                        try:
-                            result_file.write_text(st.model_dump_json(indent=2), encoding="utf-8")
-                        except Exception:
-                            pass
+            if _is_link_or_junction(result_file) or not result_file.is_file():
+                continue
+            try:
+                if result_file.stat().st_nlink > 1:
+                    continue
+                with open(result_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                st = StatusResponse.model_validate(data)
+                if st.status in ("starting", "running"):
+                    st.status = "failed"
+                    st.error = st.error or "Worker restarted while task was in progress."
+                    st.finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     self._runs[st.run_id] = st
-                except Exception:
-                    pass
+                    self._persist_result(st.run_id)
+                else:
+                    self._runs[st.run_id] = st
+            except Exception:
+                pass
 
     def get_run_status(self, run_id: str) -> Optional[StatusResponse]:
         try:
@@ -435,11 +437,14 @@ class TaskRunner:
             st = self._runs.get(run_id)
             if not st:
                 return None
-            agent_log = run_dir / ".hive" / "agent.log" if (run_dir / ".hive" / "agent.log").exists() else (run_dir / "agent.log")
-            wrapper_log = run_dir / ".hive" / "wrapper.log" if (run_dir / ".hive" / "wrapper.log").exists() else (run_dir / "wrapper.log")
-            if st.status in ("starting", "running"):
-                st.log_tail = _safe_tail(agent_log, root_dir=run_dir) or _safe_tail(wrapper_log, root_dir=run_dir)
-            return st
+            if st.status not in ("starting", "running"):
+                return st
+            snapshot = st.model_copy()
+
+        agent_log = run_dir / ".hive" / "agent.log" if (run_dir / ".hive" / "agent.log").exists() else (run_dir / "agent.log")
+        wrapper_log = run_dir / ".hive" / "wrapper.log" if (run_dir / ".hive" / "wrapper.log").exists() else (run_dir / "wrapper.log")
+        snapshot.log_tail = _safe_tail(agent_log, root_dir=run_dir) or _safe_tail(wrapper_log, root_dir=run_dir)
+        return snapshot
 
     def read_log(self, run_id: str, name: str, max_bytes: int) -> Dict[str, object]:
         """Return the last ``max_bytes`` of one of a run's logs (.hive/<name>.log).
@@ -560,10 +565,15 @@ class TaskRunner:
             run_dir = self._run_dir_for(run_id)
         except ValueError:
             return
+        if _is_link_or_junction(run_dir):
+            return
         run_dir.mkdir(parents=True, exist_ok=True)
         res_file = run_dir / "result.json"
         try:
-            with open(res_file, "w", encoding="utf-8") as f:
+            if _is_link_or_junction(res_file) or (res_file.exists() and res_file.stat().st_nlink > 1):
+                self._remove_entry_readonly_safe(res_file)
+            fd = os.open(res_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(st.model_dump_json(indent=2))
         except Exception:
             pass
@@ -638,6 +648,13 @@ class TaskRunner:
                 pass
             if removed_any:
                 pruned_runs += 1
+
+        max_in_memory = max(200, keep_count * 10)
+        if len(completed) > max_in_memory:
+            with self._lock:
+                for stale_run in completed[max_in_memory:]:
+                    if stale_run.status in terminal_statuses:
+                        self._runs.pop(stale_run.run_id, None)
         return pruned_runs
 
     def _run_git_cmd(
@@ -682,21 +699,35 @@ class TaskRunner:
                 if self._active_procs.get(run_id) is proc:
                     self._active_procs.pop(run_id, None)
 
+    def _safe_git_prefix(self) -> List[str]:
+        """Git invocation prefix that disables hooks, fsmonitor, and ext:: remote helpers."""
+        return [
+            "git",
+            "-c", f"core.hooksPath={self.empty_hooks_dir}",
+            "-c", "core.fsmonitor=false",
+            "-c", "protocol.ext.allow=never",
+        ]
+
     def _ensure_mirror(self, repo_url: str, env: Dict[str, str]) -> Optional[Path]:
         """Create or update a local bare mirror for repo_url so clones stay local and fast."""
         repo_url = validate_repo_url(repo_url)
-        digest = hashlib.sha256(repo_url.encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha256(repo_url.encode("utf-8")).hexdigest()[:32]
         mirror_dir = self.mirrors_root / f"{digest}.git"
         lock = self._get_mirror_lock(digest)
+        safe_git = self._safe_git_prefix()
 
         with lock:
             try:
+                if _is_link_or_junction(self.mirrors_root):
+                    self._remove_entry_readonly_safe(self.mirrors_root)
                 self.mirrors_root.mkdir(parents=True, exist_ok=True)
+                if _is_link_or_junction(mirror_dir):
+                    self._remove_entry_readonly_safe(mirror_dir)
                 if not (mirror_dir / "HEAD").exists():
                     if mirror_dir.exists():
                         shutil.rmtree(mirror_dir, ignore_errors=True)
                     res = subprocess.run(
-                        ["git", "clone", "--bare", "--", repo_url, str(mirror_dir)],
+                        [*safe_git, "clone", "--bare", "--", repo_url, str(mirror_dir)],
                         capture_output=True,
                         text=True,
                         env=env,
@@ -707,7 +738,7 @@ class TaskRunner:
                         return None
                 else:
                     res = subprocess.run(
-                        ["git", "--git-dir", str(mirror_dir), "fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*"],
+                        [*safe_git, "--git-dir", str(mirror_dir), "fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*"],
                         capture_output=True,
                         text=True,
                         env=env,
@@ -731,85 +762,63 @@ class TaskRunner:
         env: Dict[str, str],
         log_wrapper,
     ) -> Optional[str]:
-        """Clone or update the repository using the local bare mirror cache and checkout the target branch."""
+        """Clone a fresh repository workspace using the local bare mirror cache and checkout the target branch."""
         repo_url = validate_repo_url(req.repo_url)
         branch = validate_branch_name(branch) or f"exp/{req.run_id[:12]}-worker"
-        git_dir = run_dir / ".git"
-        if _is_link_or_junction(git_dir):
-            self._remove_entry_readonly_safe(git_dir)
-        if not git_dir.exists():
-            mirror_dir = self._ensure_mirror(repo_url, env)
-            if self._is_cancelled(req.run_id):
-                return None
-            # Clear any non-git metadata files before git clone into run_dir
-            existing_items = list(run_dir.iterdir())
-            saved_files: Dict[str, bytes] = {}
-            for item in existing_items:
-                if _is_link_or_junction(item):
-                    self._remove_entry_readonly_safe(item)
-                elif item.is_file():
-                    try:
-                        if item.name == "result.json" and item.stat().st_nlink == 1:
-                            saved_files[item.name] = item.read_bytes()
-                    except Exception:
-                        pass
-                    self._remove_entry_readonly_safe(item)
-                elif item.is_dir():
-                    self._remove_entry_readonly_safe(item)
+        safe_git = self._safe_git_prefix()
+        mirror_dir = self._ensure_mirror(repo_url, env)
+        if self._is_cancelled(req.run_id):
+            return None
 
-            try:
-                if mirror_dir is not None:
-                    clone_res = self._run_git_cmd(
-                        req.run_id,
-                        ["git", "clone", "--", str(mirror_dir), "."],
+        # Clear any pre-existing workspace files (including any poisoned .git or stale .hive
+        # from an interrupted or previous run with the same run_id) before cloning fresh.
+        existing_items = list(run_dir.iterdir())
+        saved_files: Dict[str, bytes] = {}
+        for item in existing_items:
+            if _is_link_or_junction(item):
+                self._remove_entry_readonly_safe(item)
+            elif item.is_file():
+                try:
+                    if item.name == "result.json" and item.stat().st_nlink == 1:
+                        saved_files[item.name] = item.read_bytes()
+                except Exception:
+                    pass
+                self._remove_entry_readonly_safe(item)
+            elif item.is_dir():
+                self._remove_entry_readonly_safe(item)
+
+        try:
+            if mirror_dir is not None:
+                clone_res = self._run_git_cmd(
+                    req.run_id,
+                    [*safe_git, "clone", "--", str(mirror_dir), "."],
+                    cwd=run_dir,
+                    env=env,
+                )
+                if clone_res.returncode == 0:
+                    subprocess.run(
+                        [*safe_git, "remote", "set-url", "origin", "--", repo_url],
                         cwd=run_dir,
+                        capture_output=True,
+                        text=True,
                         env=env,
                     )
-                    if clone_res.returncode == 0:
-                        subprocess.run(
-                            ["git", "remote", "set-url", "origin", "--", repo_url],
-                            cwd=run_dir,
-                            capture_output=True,
-                            text=True,
-                            env=env,
-                        )
-                else:
-                    clone_res = self._run_git_cmd(
-                        req.run_id,
-                        ["git", "clone", "--", repo_url, "."],
-                        cwd=run_dir,
-                        env=env,
-                    )
-                if self._is_cancelled(req.run_id):
-                    return None
-                if clone_res.returncode != 0:
-                    raise RuntimeError(f"Git clone failed: {(clone_res.stderr or clone_res.stdout).strip()}")
-            finally:
-                for fname, content in saved_files.items():
-                    target = run_dir / fname
-                    if not target.exists():
-                        target.write_bytes(content)
-        else:
-            # Re-using an existing workspace: remove stale .hive logs from any previous run
-            hive_dir = run_dir / ".hive"
-            if _is_link_or_junction(hive_dir) or hive_dir.exists():
-                self._remove_entry_readonly_safe(hive_dir)
-            subprocess.run(
-                ["git", "remote", "set-url", "origin", "--", repo_url],
-                cwd=run_dir,
-                capture_output=True,
-                env=env,
-            )
-            fetch_res = self._run_git_cmd(
-                req.run_id,
-                ["git", "fetch", "--prune", "origin"],
-                cwd=run_dir,
-                env=env,
-            )
+            else:
+                clone_res = self._run_git_cmd(
+                    req.run_id,
+                    [*safe_git, "clone", "--", repo_url, "."],
+                    cwd=run_dir,
+                    env=env,
+                )
             if self._is_cancelled(req.run_id):
                 return None
-            if fetch_res.returncode != 0:
-                raise RuntimeError(f"Git fetch failed: {(fetch_res.stderr or fetch_res.stdout).strip()}")
+            if clone_res.returncode != 0:
+                raise RuntimeError(f"Git clone failed: {(clone_res.stderr or clone_res.stdout).strip()}")
+        finally:
+            for fname, content in saved_files.items():
+                target = run_dir / fname
+                if not target.exists():
+                    target.write_bytes(content)
 
         _write_git_exclude(run_dir)
 
@@ -817,7 +826,7 @@ class TaskRunner:
         if req.base_branch:
             base_ref = f"origin/{req.base_branch}"
             exists = subprocess.run(
-                ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/{base_ref}"],
+                [*safe_git, "show-ref", "--verify", "--quiet", f"refs/remotes/{base_ref}"],
                 cwd=run_dir,
                 capture_output=True,
                 env=env,
@@ -833,7 +842,7 @@ class TaskRunner:
         log_wrapper(f"Starting from {base_ref or 'an empty repository'}")
         if base_ref:
             checkout_res = subprocess.run(
-                ["git", "checkout", "-B", branch, base_ref],
+                [*safe_git, "checkout", "-B", branch, base_ref],
                 cwd=run_dir,
                 capture_output=True,
                 text=True,
@@ -843,15 +852,15 @@ class TaskRunner:
                 raise RuntimeError(
                     f"Failed to checkout {branch} from {base_ref}: {(checkout_res.stderr or checkout_res.stdout).strip()}"
                 )
-            subprocess.run(["git", "reset", "--hard", base_ref], cwd=run_dir, capture_output=True, env=env)
+            subprocess.run([*safe_git, "reset", "--hard", base_ref], cwd=run_dir, capture_output=True, env=env)
             subprocess.run(
-                ["git", "clean", "-fd", "-e", ".hive", "-e", "result.json"],
+                [*safe_git, "clean", "-fd", "-e", ".hive", "-e", "result.json"],
                 cwd=run_dir,
                 capture_output=True,
                 env=env,
             )
         else:
-            subprocess.run(["git", "checkout", "-B", branch], cwd=run_dir, capture_output=True, env=env)
+            subprocess.run([*safe_git, "checkout", "-B", branch], cwd=run_dir, capture_output=True, env=env)
 
         _sanitize_git_dir(run_dir)
         return _git_head(run_dir, env)
@@ -971,6 +980,8 @@ class TaskRunner:
             git_config_snapshot = git_config_path.read_bytes() if git_config_path.exists() else None
 
             # 2. Setup run directory metadata files
+            if _is_link_or_junction(hive_meta_dir):
+                self._remove_entry_readonly_safe(hive_meta_dir)
             hive_meta_dir.mkdir(parents=True, exist_ok=True)
             log_wrapper(f"Starting task {req.run_id} (Engine: {req.agent_engine}, Strategy: {req.strategy})")
 
@@ -983,6 +994,8 @@ class TaskRunner:
                 "Change code only. Do not commit, push, or change git remotes.\n\n"
                 f"Task:\n{req.prompt.rstrip()}\n"
             )
+            if _is_link_or_junction(prompt_file) or (prompt_file.exists() and prompt_file.stat().st_nlink > 1):
+                self._remove_entry_readonly_safe(prompt_file)
             prompt_file.write_text(full_prompt, encoding="utf-8")
 
             # 4. Build Agent Command (never uses shell=True)
@@ -1024,6 +1037,10 @@ class TaskRunner:
                     timeout=self.agent_timeout,
                 )
             except subprocess.TimeoutExpired:
+                try:
+                    _sanitize_git_dir(run_dir, git_config_snapshot)
+                except Exception:
+                    pass
                 log_wrapper(f"Agent timed out after {int(self.agent_timeout)}s and was terminated.")
                 with self._lock:
                     if req.run_id not in self._cancelled:
@@ -1034,6 +1051,10 @@ class TaskRunner:
                 return
 
             if self._is_cancelled(req.run_id):
+                try:
+                    _sanitize_git_dir(run_dir, git_config_snapshot)
+                except Exception:
+                    pass
                 log_wrapper("Run was cancelled; skipping tests, commit, and push.")
                 return
 
@@ -1118,11 +1139,7 @@ class TaskRunner:
             # 8. Git Commit & Push
             _sanitize_git_dir(run_dir, git_config_snapshot)
             _write_git_exclude(run_dir)
-            safe_git = [
-                "git",
-                "-c", f"core.hooksPath={self.empty_hooks_dir}",
-                "-c", "core.fsmonitor=false",
-            ]
+            safe_git = self._safe_git_prefix()
             status_res = subprocess.run(
                 [*safe_git, "status", "--porcelain"],
                 cwd=run_dir,
