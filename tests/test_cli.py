@@ -55,6 +55,11 @@ def test_requests_are_logged_once(tmp_path, started):
     assert started["access_log"] is False
 
 
-def test_version_reports_0_3_0():
-    result = CliRunner().invoke(main, ["--version"])
-    assert "0.3.0" in result.output
+def test_version_matches_the_package():
+    # __init__.py and pyproject.toml must be bumped together.
+    from importlib.metadata import version
+
+    from hivemind_worker import __version__
+
+    assert version("hivemind-worker") == __version__
+    assert __version__ in CliRunner().invoke(main, ["--version"]).output
