@@ -252,6 +252,21 @@ def test_agent_without_changes_reports_no_changes(tmp_path, origin_repo, fake_ag
     assert git(origin_repo, "branch", "--list", req.branch) == ""
 
 
+def test_agent_without_changes_skips_tests(tmp_path, origin_repo, fake_agent):
+    # Without this, a broken repo the agent didn't touch was reported as a test failure.
+    fake_agent["mode"] = "noop"
+    runner = TaskRunner(tmp_path / "ws")
+    dispatch(runner, origin_repo, test_command=f'"{sys.executable}" -c "import sys; sys.exit(1)"',
+             bench_command=f'"{sys.executable}" -c "print(1)"')
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "no_changes", st.error
+    assert st.test_exit_code is None and st.bench_exit_code is None
+    assert "tests and benchmark were not run" in st.error
+    assert not (tmp_path / "ws" / "r1" / ".hive" / "test.log").exists()
+
+
 TEST_LEAVES_FILES = """
 import pathlib, subprocess
 pathlib.Path(".coverage").write_text("artefact")

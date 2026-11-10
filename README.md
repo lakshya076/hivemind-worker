@@ -101,7 +101,7 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
    - On Windows, `.cmd` shims (such as npm's `claude.cmd`) are started through `cmd.exe` with the whole command quoted, so install paths with spaces (`C:\Users\John Smith\...`) work.
    - `/health` and the runner find agent CLIs the same way: `PATH` first, then the usual install folders (`~/.local/bin`, `~/.cargo/bin`, npm's global folder on Windows). The worker never reports an engine it can't start, even when a service runs with a minimal `PATH`.
    - No agent is ever started through a shell. The agent is killed with its whole process tree after `agent_timeout` seconds.
-5. **Commit.** As soon as the agent exits, its changes are committed as `hive: <strategy> (run <run_id>)`.
+5. **Commit.** As soon as the agent exits, its changes are committed as `hive: <strategy> (run <run_id>)`. If it changed no files, the run ends `no_changes` here: tests and benchmark are skipped, because they would only test the unchanged base branch.
 6. **Tests and benchmark.** `test_command` and `bench_command` run in the workspace and are killed after `test_timeout` seconds. Benchmark output is parsed as JSON; output that is not JSON is kept as `{"raw_output": ...}`. Output over 64 KiB is not read whole: only its last lines are kept, marked `[benchmark output truncated: <size> bytes]`.
 7. **Push.** Exactly the agent's commit is force-pushed to the branch. Files the tests or benchmark create (`.coverage`, build output) and anything they commit are never pushed.
 8. **Result.** The final status is written to `<run_id>/result.json`, readable only by the worker's user on Linux/macOS. Logs stay in `<run_id>/.hive/` (`wrapper.log`, `agent.log`, `test.log`, `bench.log`).
@@ -111,7 +111,7 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
 | `starting` | Queued or preparing the workspace |
 | `running` | Agent, tests or benchmark in progress |
 | `succeeded` | Agent exited 0, tests passed (or none given), and the branch was pushed (`pushed: true`, `commit` set) |
-| `no_changes` | Agent and tests succeeded but no files changed; nothing was pushed |
+| `no_changes` | The agent exited 0 without changing any file; tests and benchmark were skipped and nothing was pushed |
 | `failed` | Agent exited non-zero, tests failed, a timeout hit, `git push` failed, or the worker restarted mid-run. `error` says which |
 | `cancelled` | Cancelled through `DELETE /cancel/{run_id}`; tests, commit and push are skipped |
 
