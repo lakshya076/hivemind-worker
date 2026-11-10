@@ -101,9 +101,10 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
    - On Windows, `.cmd` shims (such as npm's `claude.cmd`) are started through `cmd.exe` with the whole command quoted, so install paths with spaces (`C:\Users\John Smith\...`) work.
    - `/health` and the runner find agent CLIs the same way: `PATH` first, then the usual install folders (`~/.local/bin`, `~/.cargo/bin`, npm's global folder on Windows). The worker never reports an engine it can't start, even when a service runs with a minimal `PATH`.
    - No agent is ever started through a shell. The agent is killed with its whole process tree after `agent_timeout` seconds.
-5. **Tests and benchmark.** `test_command` and `bench_command` run in the workspace and are killed after `test_timeout` seconds. Benchmark output is parsed as JSON; output that is not JSON is kept as `{"raw_output": ...}`. Output over 64 KiB is not read whole: only its last lines are kept, marked `[benchmark output truncated: <size> bytes]`.
-6. **Commit and push.** Changes are committed as `hive: <strategy> (run <run_id>)` and force-pushed to the branch.
-7. **Result.** The final status is written to `<run_id>/result.json`, readable only by the worker's user on Linux/macOS. Logs stay in `<run_id>/.hive/` (`wrapper.log`, `agent.log`, `test.log`, `bench.log`).
+5. **Commit.** As soon as the agent exits, its changes are committed as `hive: <strategy> (run <run_id>)`.
+6. **Tests and benchmark.** `test_command` and `bench_command` run in the workspace and are killed after `test_timeout` seconds. Benchmark output is parsed as JSON; output that is not JSON is kept as `{"raw_output": ...}`. Output over 64 KiB is not read whole: only its last lines are kept, marked `[benchmark output truncated: <size> bytes]`.
+7. **Push.** Exactly the agent's commit is force-pushed to the branch. Files the tests or benchmark create (`.coverage`, build output) and anything they commit are never pushed.
+8. **Result.** The final status is written to `<run_id>/result.json`, readable only by the worker's user on Linux/macOS. Logs stay in `<run_id>/.hive/` (`wrapper.log`, `agent.log`, `test.log`, `bench.log`).
 
 | Status | Meaning |
 |---|---|

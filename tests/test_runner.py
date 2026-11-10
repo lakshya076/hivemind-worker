@@ -252,6 +252,31 @@ def test_agent_without_changes_reports_no_changes(tmp_path, origin_repo, fake_ag
     assert git(origin_repo, "branch", "--list", req.branch) == ""
 
 
+TEST_LEAVES_FILES = """
+import pathlib, subprocess
+pathlib.Path(".coverage").write_text("artefact")
+pathlib.Path("feature.txt").write_text("changed by the test")
+subprocess.run(["git", "add", "-A"])
+subprocess.run(["git", "commit", "-qm", "sneaky"])
+"""
+
+
+def test_only_the_agents_changes_are_pushed(tmp_path, origin_repo, fake_agent, git):
+    script = tmp_path / "leaves_files.py"
+    script.write_text(TEST_LEAVES_FILES, encoding="utf-8")
+    runner = TaskRunner(tmp_path / "ws")
+    req = dispatch(runner, origin_repo, test_command=f'"{sys.executable}" "{script}"')
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "succeeded", st.error
+    assert st.commit == git(origin_repo, "rev-parse", f"refs/heads/{req.branch}")
+    files = git(origin_repo, "ls-tree", "-r", "--name-only", req.branch).splitlines()
+    assert ".coverage" not in files
+    assert git(origin_repo, "show", f"{req.branch}:feature.txt") == "done"
+    assert git(origin_repo, "log", "--format=%s", "-1", req.branch).startswith("hive: simd")
+
+
 def test_agent_failure_reports_exit_code(tmp_path, origin_repo, fake_agent):
     fake_agent["mode"] = "fail"
     runner = TaskRunner(tmp_path / "ws")
