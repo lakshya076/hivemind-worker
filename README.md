@@ -67,6 +67,7 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
 | `max_retained_workspaces` | `20` | Completed run working trees kept on disk (`result.json` and `.hive/` logs are always kept) |
 | `agent_timeout` | `1800` | Seconds an agent session may run before its process tree is killed |
 | `test_timeout` | `300` | Seconds each test or benchmark command may run before it is killed |
+| `git_timeout` | `300` | Seconds each git clone, fetch or push may run before it is killed |
 
 ---
 
@@ -91,7 +92,7 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
 ## ⚙️ How a Run Works
 
 1. **Queue.** The run starts as `starting` and waits for one of `max_concurrent_runs` slots. A queued run can be cancelled before it starts.
-2. **Workspace.** The run gets `<workspace_root>/<run_id>/`. Each `repo_url` is cached as a bare mirror in `<workspace_root>/.mirrors/`, so later clones are local and fast; `origin` still points at `repo_url`. If refreshing the mirror fails, the worker clones straight from `repo_url`, so it never works on a stale copy. If that fails too, the run fails with git's error before the agent starts.
+2. **Workspace.** The run gets `<workspace_root>/<run_id>/`. Every run starts from a fresh clone: anything already in that directory (for example a `.git` left by an earlier run with the same ID) is deleted first. Each `repo_url` is cached as a bare mirror in `<workspace_root>/.mirrors/`, so later clones are local and fast; `origin` still points at `repo_url`. If refreshing the mirror fails, the worker clones straight from `repo_url`, so it never works on a stale copy. If that fails too, the run fails with git's error before the agent starts. Clones, fetches and the final push are killed after `git_timeout` seconds, and cancelling a run also stops a clone or push in progress.
 3. **Branch.** The worker checks out the branch the master sends (`exp/<run_id>/<worker>-<strategy>`). It starts from `base_branch` if the master sends one (any valid branch on origin; the run fails if it doesn't exist, never falling back). Otherwise it starts from the remote default branch (`origin/HEAD`, then `origin/main`, then `origin/master`). `/status` reports the base actually used in `base_branch`. If the master sends no branch, the worker uses `exp/<first 12 characters of run_id>-worker-<strategy>`. Worker and agent files (`.hive/`, `.agy/`, `.aider*`, `result.json`, `__pycache__/`) are listed in `.git/info/exclude`, so the repository's `.gitignore` is never changed.
 4. **Agent.** `.hive/prompt.txt` gets a fixed header naming the strategy, then `Task:` and the master's prompt. The header means the file never starts with the task text, which matters because aider runs a message starting with `/` or `!` as a command, and Claude Code treats a leading `/` as a slash command.
    - Aider reads it with `--message-file`. It runs with `--yes-always`, which accepts every routine prompt. So the worker also turns off the prompts it must never accept: self-upgrade via pip (`--no-check-update`), fetching URLs found in the prompt (`--no-detect-urls`), editing `.gitignore` (`--no-gitignore`), and the analytics opt-in (`--no-analytics`).
@@ -102,7 +103,7 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
    - No agent is ever started through a shell. The agent is killed with its whole process tree after `agent_timeout` seconds.
 5. **Tests and benchmark.** `test_command` and `bench_command` run in the workspace and are killed after `test_timeout` seconds. Benchmark output is parsed as JSON; output that is not JSON is kept as `{"raw_output": ...}`. Output over 64 KiB is not read whole: only its last lines are kept, marked `[benchmark output truncated: <size> bytes]`.
 6. **Commit and push.** Changes are committed as `hive: <strategy> (run <run_id>)` and force-pushed to the branch.
-7. **Result.** The final status is written to `<run_id>/result.json`. Logs stay in `<run_id>/.hive/` (`wrapper.log`, `agent.log`, `test.log`, `bench.log`).
+7. **Result.** The final status is written to `<run_id>/result.json`, readable only by the worker's user on Linux/macOS. Logs stay in `<run_id>/.hive/` (`wrapper.log`, `agent.log`, `test.log`, `bench.log`).
 
 | Status | Meaning |
 |---|---|
@@ -113,7 +114,7 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
 | `failed` | Agent exited non-zero, tests failed, a timeout hit, `git push` failed, or the worker restarted mid-run. `error` says which |
 | `cancelled` | Cancelled through `DELETE /cancel/{run_id}`; tests, commit and push are skipped |
 
-After each run, working trees beyond the newest `max_retained_workspaces` completed runs are deleted. `result.json` and `.hive/` logs are kept, so `/runs` and `/status` keep the full history.
+After each run, working trees beyond the newest `max_retained_workspaces` completed runs are deleted. `result.json` and `.hive/` logs are kept, so `/runs` and `/status` keep the history. Only the newest `max(200, 10 × max_retained_workspaces)` finished runs stay in memory; older ones drop out of `/runs` and `/status` until the next restart reloads them from disk.
 
 ---
 
@@ -127,9 +128,9 @@ After each run, working trees beyond the newest `max_retained_workspaces` comple
 - **Fail-closed config**: If `worker.json` exists but cannot be read or validated, the daemon refuses to start instead of falling back to a keyless default.
 
 **Runs**
-- **Workspace confinement**: Every run lives in `<workspace_root>/<run_id>/`; the `run_id` is validated so it cannot escape. The worker never follows symlinks, hardlinks or NTFS junctions when reading logs or deleting old workspaces, so a run cannot make it read or delete files outside the workspace.
+- **Workspace confinement**: Every run lives in `<workspace_root>/<run_id>/`; the `run_id` is validated so it cannot escape. The worker never follows symlinks, hardlinks or NTFS junctions when reading logs and benchmark output, writing logs, `prompt.txt` and `result.json`, or deleting old workspaces, so a run cannot make it read, overwrite or delete files outside the workspace.
 - **Git injection protection**: `repo_url` values that start with `-`, use remote helpers (`ext::`, `fd::`), are UNC network shares (`\\server\share`, `//server/share`), or contain whitespace are rejected. Git commands pass `--` before URLs and branch names.
-- **Agent cannot hijack git**: After the agent exits, the worker deletes anything in `.git/hooks/` and restores `.git/config` from a copy taken before the agent ran. Commit and push run with an empty hooks directory, `core.fsmonitor=false` and `--no-verify`.
+- **Agent cannot hijack git**: After the agent exits, the worker deletes anything in `.git/hooks/` and restores `.git/config` from a copy taken before the agent ran. Every git command (clone, checkout, commit, push) runs with an empty hooks directory, `core.fsmonitor=false` and `protocol.ext.allow=never`, and push also uses `--no-verify`. If the agent removes `.git` or replaces it with a link, the run fails instead of committing.
 - **Stripped environment**: Subprocesses get only `PATH`, OS essentials, `HOME` and a git identity, with no other variables (no `SSH_AUTH_SOCK`, cloud credentials, and so on). AI provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`) are read from the environment or `~/.env` and put in the environment of the agent only, not of tests, benchmarks or git. This keeps them out of environment dumps and test logs. **It is not isolation**; see the trust model below.
 - **Exp branches only**: The worker only pushes branches under `exp/`, so a bad dispatch can never force-push `main`.
 
@@ -276,5 +277,7 @@ Tests live in `tests/` and use pytest. They run offline: the HTTP API is driven 
 uv run pytest            # creates .venv with the dev dependency group on first run
 uv run pytest -k runner  # run a subset
 ```
+
+GitHub Actions (`.github/workflows/tests.yml`) runs the same suite on Ubuntu and Windows with Python 3.10 and 3.13, for every pull request and every push to `main`.
 
 

@@ -237,6 +237,8 @@ def test_successful_run_pushes_branch_to_origin(tmp_path, origin_repo, fake_agen
     assert ".hive/prompt.txt" not in files and "result.json" not in files
     saved = json.loads((tmp_path / "ws" / "r1" / "result.json").read_text())
     assert saved["status"] == "succeeded"
+    if os.name != "nt":  # result.json survives the fresh clone still private
+        assert (tmp_path / "ws" / "r1" / "result.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_agent_without_changes_reports_no_changes(tmp_path, origin_repo, fake_agent, git):

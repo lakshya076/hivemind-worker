@@ -773,19 +773,8 @@ class TaskRunner:
         # Clear any pre-existing workspace files (including any poisoned .git or stale .hive
         # from an interrupted or previous run with the same run_id) before cloning fresh.
         existing_items = list(run_dir.iterdir())
-        saved_files: Dict[str, bytes] = {}
         for item in existing_items:
-            if _is_link_or_junction(item):
-                self._remove_entry_readonly_safe(item)
-            elif item.is_file():
-                try:
-                    if item.name == "result.json" and item.stat().st_nlink == 1:
-                        saved_files[item.name] = item.read_bytes()
-                except Exception:
-                    pass
-                self._remove_entry_readonly_safe(item)
-            elif item.is_dir():
-                self._remove_entry_readonly_safe(item)
+            self._remove_entry_readonly_safe(item)
 
         try:
             if mirror_dir is not None:
@@ -815,10 +804,8 @@ class TaskRunner:
             if clone_res.returncode != 0:
                 raise RuntimeError(f"Git clone failed: {(clone_res.stderr or clone_res.stdout).strip()}")
         finally:
-            for fname, content in saved_files.items():
-                target = run_dir / fname
-                if not target.exists():
-                    target.write_bytes(content)
+            # Rewrite result.json from memory (mode 0600); the clone needed an empty directory.
+            self._persist_result(req.run_id)
 
         _write_git_exclude(run_dir)
 

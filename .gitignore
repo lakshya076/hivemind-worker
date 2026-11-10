@@ -8,3 +8,6 @@ build/
 
 # Local virtualenv
 .venv/
+
+# uv lockfile (not committed)
+uv.lock
