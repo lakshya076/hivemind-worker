@@ -1057,23 +1057,43 @@ class TaskRunner:
             # changed nothing skips them.
             _write_git_exclude(run_dir)
             safe_git = self._safe_git_prefix()
-            status_res = subprocess.run(
+            status_res = self._run_git_cmd(
+                req.run_id,
                 [*safe_git, "status", "--porcelain"],
                 cwd=run_dir,
-                capture_output=True,
-                text=True,
                 env=env,
             )
+            if self._is_cancelled(req.run_id):
+                return
+            if status_res.returncode != 0:
+                err_msg = (status_res.stderr or status_res.stdout).strip() or f"exit {status_res.returncode}"
+                raise RuntimeError(f"Git status failed: {err_msg}")
+
             if status_res.stdout.strip():
                 log_wrapper("Modifications detected. Committing changes...")
-                subprocess.run([*safe_git, "add", "-A"], cwd=run_dir, capture_output=True, env=env)
-                subprocess.run(
-                    [*safe_git, "commit", "--no-verify", "-m", f"hive: {req.strategy} (run {req.run_id})"],
+                add_res = self._run_git_cmd(
+                    req.run_id,
+                    [*safe_git, "add", "-A"],
                     cwd=run_dir,
-                    capture_output=True,
-                    text=True,
                     env=env,
                 )
+                if self._is_cancelled(req.run_id):
+                    return
+                if add_res.returncode != 0:
+                    err_msg = (add_res.stderr or add_res.stdout).strip() or f"exit {add_res.returncode}"
+                    raise RuntimeError(f"Git add failed: {err_msg}")
+
+                commit_res = self._run_git_cmd(
+                    req.run_id,
+                    [*safe_git, "commit", "--no-verify", "-m", f"hive: {req.strategy} (run {req.run_id})"],
+                    cwd=run_dir,
+                    env=env,
+                )
+                if self._is_cancelled(req.run_id):
+                    return
+                if commit_res.returncode != 0:
+                    err_msg = (commit_res.stderr or commit_res.stdout).strip() or f"exit {commit_res.returncode}"
+                    raise RuntimeError(f"Git commit failed: {err_msg}")
             agent_head = _git_head(run_dir, env)
             has_changes = bool(agent_head and agent_head != base_head)
             if not has_changes:
