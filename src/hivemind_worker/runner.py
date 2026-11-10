@@ -1138,6 +1138,25 @@ class TaskRunner:
             if req.bench_command and has_changes:
                 if self._is_cancelled(req.run_id):
                     return
+                if req.test_command and agent_head:
+                    # Restore the exact agent_head working tree if the test command mutated
+                    # tracked files, committed, or left untracked test artifacts behind.
+                    _sanitize_git_dir(run_dir, git_config_snapshot)
+                    _write_git_exclude(run_dir)
+                    self._run_git_cmd(
+                        req.run_id,
+                        [*safe_git, "reset", "--hard", agent_head],
+                        cwd=run_dir,
+                        env=env,
+                    )
+                    self._run_git_cmd(
+                        req.run_id,
+                        [*safe_git, "clean", "-fd"],
+                        cwd=run_dir,
+                        env=env,
+                    )
+                    if self._is_cancelled(req.run_id):
+                        return
                 log_wrapper(f"Running bench command: {req.bench_command}")
                 try:
                     bench_exit = self._run_managed_proc(
