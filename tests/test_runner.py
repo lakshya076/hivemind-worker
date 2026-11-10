@@ -292,6 +292,24 @@ def test_only_the_agents_changes_are_pushed(tmp_path, origin_repo, fake_agent, g
     assert git(origin_repo, "log", "--format=%s", "-1", req.branch).startswith("hive: simd")
 
 
+def test_git_commit_failure_reports_failed_not_no_changes(tmp_path, origin_repo, fake_agent, monkeypatch):
+    runner = TaskRunner(tmp_path / "ws")
+    orig_run_git_cmd = runner._run_git_cmd
+
+    def fail_on_commit(run_id, args, **kwargs):
+        if "commit" in args:
+            return subprocess.CompletedProcess(args, 128, stdout="", stderr="fatal: unable to write new_index file")
+        return orig_run_git_cmd(run_id, args, **kwargs)
+
+    monkeypatch.setattr(runner, "_run_git_cmd", fail_on_commit)
+    dispatch(runner, origin_repo)
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "failed"
+    assert "Git commit failed" in (st.error or "")
+
+
 def test_agent_failure_reports_exit_code(tmp_path, origin_repo, fake_agent):
     fake_agent["mode"] = "fail"
     runner = TaskRunner(tmp_path / "ws")
