@@ -42,6 +42,14 @@ elif mode in ("tamper", "tamper_only"):
         pathlib.Path("tests/helper.py").unlink()
         pathlib.Path("tests/new_test.py").write_text("x = 1\\n")
         pathlib.Path("feature.txt").write_text("done\\n")
+elif mode == "tamper_commit":
+    import subprocess
+    pathlib.Path("tests/check.py").write_text("")
+    subprocess.run(["git", "add", "tests/check.py"], check=True)
+    subprocess.run(["git", "commit", "-qm", "agent committed tampered test"], check=True)
+elif mode == "tamper_new_file":
+    pathlib.Path("conftest.py").write_text("import sys; sys.exit(0)\\n")
+    pathlib.Path("feature.txt").write_text("done\\n")
 elif mode == "sleep":
     time.sleep(60)
 elif mode == "fail":
@@ -754,3 +762,30 @@ def test_protect_without_agent_changes_reports_empty_list(tmp_path, protected_or
 
     assert st.status == "succeeded", st.error
     assert st.protected_reverted == []
+
+
+def test_protected_path_absent_from_base_is_removed_when_added_by_agent(tmp_path, protected_origin, fake_agent, git):
+    fake_agent["mode"] = "tamper_new_file"
+    runner = TaskRunner(tmp_path / "ws")
+    req = dispatch(runner, protected_origin, protect_paths=["conftest.py"],
+                   test_command=f'"{sys.executable}" tests/check.py')
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "succeeded", st.error
+    assert st.protected_reverted == ["conftest.py"]
+    assert not (tmp_path / "ws" / "r1" / "conftest.py").exists()
+    assert git(protected_origin, "diff", "--name-only", "main", req.branch).splitlines() == ["feature.txt"]
+
+
+def test_agent_committing_only_protected_changes_ends_no_changes(tmp_path, protected_origin, fake_agent, git):
+    fake_agent["mode"] = "tamper_commit"
+    runner = TaskRunner(tmp_path / "ws")
+    req = dispatch(runner, protected_origin, protect_paths=["tests/check.py"],
+                   test_command=f'"{sys.executable}" tests/check.py')
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "no_changes", st.error
+    assert st.protected_reverted == ["tests/check.py"]
+    assert git(protected_origin, "branch", "--list", req.branch) == ""

@@ -725,14 +725,25 @@ class TaskRunner:
                 raise RuntimeError(f"Restoring protected paths failed (git {args[0]}): {detail}")
             return res
 
+        # If the agent ran `git commit`, move HEAD back to base_head (keeping index/worktree)
+        # so reverting protected files does not leave a dirty index against the agent's commit
+        # or leave tampered protected files in intermediate commit history.
+        if _git_head(run_dir, env) != base_head:
+            run("reset", "--soft", base_head)
+
         # Stage everything so files the agent added count as changes (and are removed below).
         run("add", "-A")
         diff = run("diff", "--cached", "--name-only", "--no-renames", "-z", base_head, "--", *paths)
         changed = [name for name in diff.stdout.split("\0") if name]
-        # git restore fails on a pathspec that matches nothing, so pass only the touched ones.
-        touched = [p for p in paths if any(name == p or name.startswith(p + "/") for name in changed)]
-        if touched:
-            run("restore", f"--source={base_head}", "--staged", "--worktree", "--", *touched)
+        if changed:
+            ls_base = run("ls-tree", "-r", "--name-only", "-z", base_head, "--", *paths)
+            in_base = {name for name in ls_base.stdout.split("\0") if name}
+            to_restore = [name for name in changed if name in in_base]
+            to_remove = [name for name in changed if name not in in_base]
+            if to_restore:
+                run("restore", f"--source={base_head}", "--staged", "--worktree", "--", *to_restore)
+            if to_remove:
+                run("rm", "-rfq", "--", *to_remove)
         # Ignored files are never committed but could still change what the test command sees.
         run("clean", "-fdqx", "-e", ".hive", "-e", "result.json", "--", *paths)
         return changed
