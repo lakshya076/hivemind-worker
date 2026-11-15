@@ -1,10 +1,13 @@
 import ipaddress
 import json
 import os
+import re
 import secrets
 from pathlib import Path
 from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
+
+_CLAUDE_TOOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.*:(), /-]{0,119}$")
 
 # Source networks allowed to reach the daemon by default: loopback, private LAN
 # ranges (RFC 1918 / IPv6 ULA / link-local) and Tailscale (CGNAT + Tailscale ULA).
@@ -101,6 +104,22 @@ class WorkerConfig(BaseModel):
         gt=0,
         description="Seconds each git clone, fetch, or push operation may run before it is killed",
     )
+    claude_allowed_tools: Optional[List[str]] = Field(
+        default=None,
+        description="Optional worker-local allowlist of tools passed to `claude -p --allowedTools` (off by default)",
+    )
+
+    @field_validator("claude_allowed_tools")
+    @classmethod
+    def _validate_claude_tools(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if not value:
+            return None
+        cleaned: List[str] = []
+        for item in value:
+            if not isinstance(item, str) or not _CLAUDE_TOOL_RE.match(item.strip()):
+                raise ValueError(f"Invalid tool in claude_allowed_tools: {item!r}")
+            cleaned.append(item.strip())
+        return list(dict.fromkeys(cleaned))
 
     @field_validator("allowed_networks")
     @classmethod

@@ -48,6 +48,7 @@ def build_agent_command(
     prompt_file: Path,
     prompt_text: str,
     model: Optional[str] = None,
+    claude_allowed_tools: Optional[List[str]] = None,
 ) -> AgentCommand:
     """Build the launch command for a headless agent session."""
     engine_key = engine.strip().lower()
@@ -80,6 +81,11 @@ def build_agent_command(
         args = ["claude", "-p", "--permission-mode", "acceptEdits"]
         if model:
             args += ["--model", model]
+        if claude_allowed_tools:
+            for tool in claude_allowed_tools:
+                if not tool or tool.startswith("-"):
+                    raise UnsupportedEngineError(f"Invalid claude tool {tool!r}")
+            args += ["--allowedTools", *claude_allowed_tools]
         return AgentCommand(args=args, stdin_file=prompt_file)
 
     if engine_key == "agy":

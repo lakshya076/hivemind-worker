@@ -363,6 +363,7 @@ class TaskRunner:
         git_timeout: float = 300.0,
         max_concurrent_runs: int = 2,
         max_retained_workspaces: int = 20,
+        claude_allowed_tools: Optional[List[str]] = None,
     ):
         self.workspace_root = workspace_root
         self.workspace_root.mkdir(parents=True, exist_ok=True)
@@ -374,6 +375,7 @@ class TaskRunner:
         self.git_timeout = git_timeout
         self.max_concurrent_runs = max(1, int(max_concurrent_runs))
         self.max_retained_workspaces = max(0, int(max_retained_workspaces))
+        self.claude_allowed_tools = list(claude_allowed_tools) if claude_allowed_tools else None
         self._run_slots = threading.Semaphore(self.max_concurrent_runs)
         self._runs: Dict[str, StatusResponse] = {}
         self._active_procs: Dict[str, subprocess.Popen] = {}
@@ -775,6 +777,40 @@ class TaskRunner:
         run("clean", "-fdqx", "-e", ".hive", "-e", "result.json", "--", *clean_targets)
         return changed
 
+    def _compute_diff_stats(
+        self,
+        run_id: str,
+        run_dir: Path,
+        env: Dict[str, str],
+        base_head: Optional[str],
+        agent_head: str,
+    ) -> tuple[int, int, int]:
+        """Return (files_changed, insertions, deletions) between base_head and agent_head."""
+        safe_git = self._safe_git_prefix()
+        if base_head:
+            cmd = [*safe_git, "diff", "--numstat", "--no-renames", "-z", base_head, agent_head]
+        else:
+            cmd = [*safe_git, "show", "--numstat", "--format=", "--no-renames", "-z", agent_head]
+        res = self._run_git_cmd(run_id, cmd, cwd=run_dir, env=env)
+        if res.returncode != 0:
+            return (0, 0, 0)
+        files_changed = 0
+        insertions = 0
+        deletions = 0
+        for rec in res.stdout.split("\0"):
+            if not rec:
+                continue
+            parts = rec.split("\t", 2)
+            if len(parts) < 3:
+                continue
+            files_changed += 1
+            ins_s, del_s, _ = parts
+            if ins_s.isdigit():
+                insertions += int(ins_s)
+            if del_s.isdigit():
+                deletions += int(del_s)
+        return (files_changed, insertions, deletions)
+
     def _ensure_mirror(self, repo_url: str, env: Dict[str, str]) -> Optional[Path]:
         """Create or update a local bare mirror for repo_url so clones stay local and fast."""
         repo_url = validate_repo_url(repo_url)
@@ -1042,9 +1078,14 @@ class TaskRunner:
             # 3. Format Prompt. It must never start with the task text: aider runs a
             # message starting with "/" or "!" as a command (e.g. "!curl ... | sh"),
             # and Claude Code treats a leading "/" as a slash command.
+            hint_line = ""
+            if req.strategy_hint and req.strategy_hint.strip():
+                clean_hint = " ".join(req.strategy_hint.strip().splitlines())
+                hint_line = f"Strategy hint: {clean_hint}\n"
             full_prompt = (
                 f"You are pursuing strategy {req.strategy_index} of {req.strategy_count}: {req.strategy}. "
                 "Take a distinct approach.\n"
+                f"{hint_line}"
                 "Change code only. Do not commit, push, or change git remotes.\n\n"
                 f"Task:\n{req.prompt.rstrip()}\n"
             )
@@ -1053,7 +1094,15 @@ class TaskRunner:
             prompt_file.write_text(full_prompt, encoding="utf-8")
 
             # 4. Build Agent Command (never uses shell=True)
-            cmd = build_agent_command(req.agent_engine, prompt_file, full_prompt, model=req.model)
+            build_kwargs: Dict[str, Any] = {"model": req.model}
+            if self.claude_allowed_tools is not None:
+                build_kwargs["claude_allowed_tools"] = self.claude_allowed_tools
+            cmd = build_agent_command(
+                req.agent_engine,
+                prompt_file,
+                full_prompt,
+                **build_kwargs,
+            )
             binary_name = cmd.args[0]
             resolved_bin = _resolve_agent_binary(binary_name, env)
             if not resolved_bin:
@@ -1078,6 +1127,17 @@ class TaskRunner:
                 self._runs[req.run_id].branch = branch
                 self._persist_result(req.run_id)
 
+            effective_agent_timeout = (
+                min(float(req.agent_timeout), self.agent_timeout)
+                if req.agent_timeout is not None
+                else self.agent_timeout
+            )
+            effective_test_timeout = (
+                min(float(req.test_timeout), self.test_timeout)
+                if req.test_timeout is not None
+                else self.test_timeout
+            )
+
             # 5. Execute Agent Process
             try:
                 agent_exit = self._run_managed_proc(
@@ -1088,18 +1148,18 @@ class TaskRunner:
                     shell=False,
                     stdin_file=cmd.stdin_file,
                     stdout_path=agent_log_path,
-                    timeout=self.agent_timeout,
+                    timeout=effective_agent_timeout,
                 )
             except subprocess.TimeoutExpired:
                 try:
                     _sanitize_git_dir(run_dir, git_config_snapshot)
                 except Exception:
                     pass
-                log_wrapper(f"Agent timed out after {int(self.agent_timeout)}s and was terminated.")
+                log_wrapper(f"Agent timed out after {int(effective_agent_timeout)}s and was terminated.")
                 with self._lock:
                     if req.run_id not in self._cancelled:
                         self._runs[req.run_id].status = "failed"
-                        self._runs[req.run_id].error = f"Agent timed out after {int(self.agent_timeout)}s"
+                        self._runs[req.run_id].error = f"Agent timed out after {int(effective_agent_timeout)}s"
                         self._runs[req.run_id].log_tail = _safe_tail(agent_log_path, root_dir=run_dir) or _safe_tail(wrapper_log_path, root_dir=run_dir)
                         self._runs[req.run_id].finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 return
@@ -1172,8 +1232,15 @@ class TaskRunner:
                     raise RuntimeError(f"Git commit failed: {err_msg}")
             agent_head = _git_head(run_dir, env)
             has_changes = bool(agent_head and agent_head != base_head)
-            if not has_changes:
+            if has_changes and agent_head:
+                fc, ins, dels = self._compute_diff_stats(req.run_id, run_dir, env, base_head, agent_head)
+            else:
+                fc, ins, dels = (0, 0, 0)
                 log_wrapper("No file modifications generated by agent; skipping tests and benchmark.")
+            with self._lock:
+                self._runs[req.run_id].files_changed = fc
+                self._runs[req.run_id].insertions = ins
+                self._runs[req.run_id].deletions = dels
 
             # 7. Run Test Command if specified
             test_exit = None
@@ -1190,14 +1257,14 @@ class TaskRunner:
                         shell=True,
                         stdin_file=None,
                         stdout_path=test_log_path,
-                        timeout=self.test_timeout,
+                        timeout=effective_test_timeout,
                     )
                 except subprocess.TimeoutExpired:
-                    log_wrapper(f"Test command timed out after {int(self.test_timeout)}s")
+                    log_wrapper(f"Test command timed out after {int(effective_test_timeout)}s")
                     with self._lock:
                         if req.run_id not in self._cancelled:
                             self._runs[req.run_id].status = "failed"
-                            self._runs[req.run_id].error = f"Test command timed out after {int(self.test_timeout)}s"
+                            self._runs[req.run_id].error = f"Test command timed out after {int(effective_test_timeout)}s"
                             self._runs[req.run_id].log_tail = _safe_tail(test_log_path, root_dir=run_dir) or _safe_tail(agent_log_path, root_dir=run_dir)
                             self._runs[req.run_id].finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     return
@@ -1243,14 +1310,14 @@ class TaskRunner:
                         shell=True,
                         stdin_file=None,
                         stdout_path=bench_log_path,
-                        timeout=self.test_timeout,
+                        timeout=effective_test_timeout,
                     )
                 except subprocess.TimeoutExpired:
-                    log_wrapper(f"Benchmark command timed out after {int(self.test_timeout)}s")
+                    log_wrapper(f"Benchmark command timed out after {int(effective_test_timeout)}s")
                     with self._lock:
                         if req.run_id not in self._cancelled:
                             self._runs[req.run_id].status = "failed"
-                            self._runs[req.run_id].error = f"Benchmark command timed out after {int(self.test_timeout)}s"
+                            self._runs[req.run_id].error = f"Benchmark command timed out after {int(effective_test_timeout)}s"
                             self._runs[req.run_id].log_tail = _safe_tail(bench_log_path, root_dir=run_dir) or _safe_tail(agent_log_path, root_dir=run_dir)
                             self._runs[req.run_id].finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     return
