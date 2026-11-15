@@ -141,3 +141,31 @@ def test_dispatch_request_defaults():
 def test_dispatch_request_rejects_bad_fields(overrides):
     with pytest.raises(ValidationError):
         base_request(**overrides)
+
+
+@pytest.mark.parametrize(
+    "paths, stored",
+    [
+        (["tests/"], ["tests"]),
+        (["tasks/add/check.py", "tests", "tests/"], ["tasks/add/check.py", "tests"]),
+        (["tests\\unit\\check.py"], ["tests/unit/check.py"]),
+        ([], None),
+    ],
+)
+def test_protect_paths_are_normalized(paths, stored):
+    assert base_request(protect_paths=paths).protect_paths == stored
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../x", "a/../b", "/abs", "C:\\x", "C:x", "-x", "--force", ":(glob)*", ".", "./tests", ".git", "a/.git/hooks",
+     "a\nb", "", "/", "x" * 513, "\\\\server\\share"],
+)
+def test_bad_protect_paths_rejected(path):
+    with pytest.raises(ValidationError):
+        base_request(protect_paths=[path])
+
+
+def test_too_many_protect_paths_rejected():
+    with pytest.raises(ValidationError):
+        base_request(protect_paths=[f"t{i}" for i in range(33)])

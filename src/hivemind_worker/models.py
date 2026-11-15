@@ -7,6 +7,9 @@ from hivemind_worker.agent import SUPPORTED_ENGINES, validate_model
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
 _FORBIDDEN_URL_PREFIXES = ("ext::", "fd::")
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+MAX_PROTECT_PATHS = 32
+MAX_PROTECT_PATH_CHARS = 512
 
 
 def validate_run_id(value: str) -> str:
@@ -77,6 +80,38 @@ def validate_branch_name(value: Optional[str]) -> Optional[str]:
     return cleaned
 
 
+def validate_protect_path(value: str) -> str:
+    """A repo-relative file or directory whose agent changes are reverted.
+
+    Backslashes count as separators so Windows-style paths work; absolute paths, drive
+    letters, '..', '.git' and anything git could read as an option are refused.
+    """
+    if not isinstance(value, str):
+        raise ValueError("protect path must be a string")
+    cleaned = value.strip().replace("\\", "/").rstrip("/")
+    if (
+        not cleaned
+        or len(cleaned) > MAX_PROTECT_PATH_CHARS
+        or cleaned.startswith(("/", "-", ":"))
+        or _DRIVE_RE.match(cleaned)
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned)
+        or any(part in ("", ".", "..", ".git") for part in cleaned.split("/"))
+    ):
+        raise ValueError(
+            f"Invalid protect path {value!r}: use a relative path inside the repository "
+            "(no '..', '.', '.git', leading '-' or '/', drive letter or control characters)"
+        )
+    return cleaned
+
+
+def validate_protect_paths(values: Optional[List[str]]) -> Optional[List[str]]:
+    if not values:
+        return None
+    if len(values) > MAX_PROTECT_PATHS:
+        raise ValueError(f"At most {MAX_PROTECT_PATHS} protect paths are allowed")
+    return list(dict.fromkeys(validate_protect_path(v) for v in values))
+
+
 class DispatchRequest(BaseModel):
     """Payload sent by HiveMind master to trigger a task run."""
     run_id: str = Field(..., description="Unique identifier for the task run")
@@ -94,6 +129,10 @@ class DispatchRequest(BaseModel):
     model: Optional[str] = Field(default=None, max_length=200, description="Optional model override")
     test_command: Optional[str] = Field(default=None, max_length=4096, description="Verification test command (e.g. 'pytest -q')")
     bench_command: Optional[str] = Field(default=None, max_length=4096, description="Benchmark command producing JSON metrics")
+    protect_paths: Optional[List[str]] = Field(
+        default=None,
+        description="Repo-relative files or directories (e.g. tests/) restored to the base after the agent runs",
+    )
     # No workspace_dir: runs are always confined to the worker's workspace_root. Older
     # masters that still send it are fine, because unknown fields are ignored.
 
@@ -132,6 +171,11 @@ class DispatchRequest(BaseModel):
         # Any valid branch may be a base (main, develop, feature/x); it is only read, never pushed.
         return validate_ref_name(value)
 
+    @field_validator("protect_paths")
+    @classmethod
+    def _check_protect_paths(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        return validate_protect_paths(value)
+
 
 class DispatchResponse(BaseModel):
     """Response returned upon accepting a dispatch job."""
@@ -159,6 +203,10 @@ class StatusResponse(BaseModel):
     agent_exit_code: Optional[int] = None
     test_exit_code: Optional[int] = None
     bench_exit_code: Optional[int] = None
+    protected_reverted: Optional[List[str]] = Field(
+        default=None,
+        description="Protected files the agent changed; they were restored to the base before tests and commit",
+    )
     benchmark_data: Optional[Any] = None
     error: Optional[str] = None
     log_tail: Optional[str] = None

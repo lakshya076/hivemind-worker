@@ -61,7 +61,10 @@ def test_dispatch_refuses_branch_outside_exp(app, tmp_path):
     assert not (tmp_path / "ws" / "r1").exists()
 
 
-@pytest.mark.parametrize("field, value", [("agent_engine", "custom"), ("model", "--dangerously-skip-permissions")])
+@pytest.mark.parametrize(
+    "field, value",
+    [("agent_engine", "custom"), ("model", "--dangerously-skip-permissions"), ("protect_paths", ["../x"])],
+)
 def test_dispatch_rejects_bad_engine_or_model_before_cloning(app, tmp_path, field, value):
     body = {"run_id": "r1", "repo_url": "https://x/y.git", "prompt": "p", field: value}
     resp = client_for(app).post("/dispatch", json=body, headers=AUTH)
@@ -76,8 +79,9 @@ def test_health_with_key(app):
 
 
 def test_health_advertises_features(app):
-    # Masters refuse --base / full logs on workers that don't list them.
-    assert set(client_for(app).get("/health", headers=AUTH).json()["features"]) >= {"base_branch", "logs"}
+    # Masters refuse --base / --protect / full logs on workers that don't list them.
+    features = set(client_for(app).get("/health", headers=AUTH).json()["features"])
+    assert features >= {"base_branch", "logs", "protect"}
 
 
 def test_logs_endpoint(app, tmp_path):

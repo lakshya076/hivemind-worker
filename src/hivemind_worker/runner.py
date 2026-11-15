@@ -708,6 +708,35 @@ class TaskRunner:
             "-c", "protocol.ext.allow=never",
         ]
 
+    def _revert_protected_paths(
+        self, run_id: str, run_dir: Path, env: Dict[str, str], base_head: str, paths: List[str]
+    ) -> List[str]:
+        """Put protected paths back exactly as they are at base_head; return the files the agent changed.
+
+        Compares with base_head, not HEAD, so changes the agent committed itself are caught too.
+        Literal pathspecs keep a path from being read as a glob or :(magic) pathspec.
+        """
+        git = [*self._safe_git_prefix(), "--literal-pathspecs"]
+
+        def run(*args: str) -> subprocess.CompletedProcess:
+            res = self._run_git_cmd(run_id, [*git, *args], cwd=run_dir, env=env)
+            if res.returncode != 0 and not self._is_cancelled(run_id):
+                detail = (res.stderr or res.stdout).strip() or f"exit {res.returncode}"
+                raise RuntimeError(f"Restoring protected paths failed (git {args[0]}): {detail}")
+            return res
+
+        # Stage everything so files the agent added count as changes (and are removed below).
+        run("add", "-A")
+        diff = run("diff", "--cached", "--name-only", "--no-renames", "-z", base_head, "--", *paths)
+        changed = [name for name in diff.stdout.split("\0") if name]
+        # git restore fails on a pathspec that matches nothing, so pass only the touched ones.
+        touched = [p for p in paths if any(name == p or name.startswith(p + "/") for name in changed)]
+        if touched:
+            run("restore", f"--source={base_head}", "--staged", "--worktree", "--", *touched)
+        # Ignored files are never committed but could still change what the test command sees.
+        run("clean", "-fdqx", "-e", ".hive", "-e", "result.json", "--", *paths)
+        return changed
+
     def _ensure_mirror(self, repo_url: str, env: Dict[str, str]) -> Optional[Path]:
         """Create or update a local bare mirror for repo_url so clones stay local and fast."""
         repo_url = validate_repo_url(repo_url)
@@ -1057,6 +1086,15 @@ class TaskRunner:
             # changed nothing skips them.
             _write_git_exclude(run_dir)
             safe_git = self._safe_git_prefix()
+            # shortcut: an empty base (no commit) has nothing to protect, so protect is skipped there.
+            if req.protect_paths and base_head:
+                reverted = self._revert_protected_paths(req.run_id, run_dir, env, base_head, req.protect_paths)
+                if self._is_cancelled(req.run_id):
+                    return
+                if reverted:
+                    log_wrapper(f"Reverted agent changes to protected files: {', '.join(reverted)}")
+                with self._lock:
+                    self._runs[req.run_id].protected_reverted = reverted
             status_res = self._run_git_cmd(
                 req.run_id,
                 [*safe_git, "status", "--porcelain"],

@@ -35,6 +35,13 @@ elif mode == "hook":
     with open(".git/config", "a") as f:
         f.write("[core]\\n\\tfsmonitor = echo pwned > pwned.txt\\n")
     pathlib.Path("feature.txt").write_text("done\\n")
+elif mode in ("tamper", "tamper_only"):
+    # Make the tests pass trivially: empty one, delete another, add a new one.
+    pathlib.Path("tests/check.py").write_text("")
+    if mode == "tamper":
+        pathlib.Path("tests/helper.py").unlink()
+        pathlib.Path("tests/new_test.py").write_text("x = 1\\n")
+        pathlib.Path("feature.txt").write_text("done\\n")
 elif mode == "sleep":
     time.sleep(60)
 elif mode == "fail":
@@ -687,4 +694,63 @@ def test_persist_result_and_load_refuse_hardlinks_to_external_files(tmp_path):
     assert runner2.get_run_status("r-link-load") is None
 
 
+ORIGINAL_CHECK = """print("original check ran")
+import pathlib, sys
+ok = pathlib.Path("tests/helper.py").exists() and not pathlib.Path("tests/new_test.py").exists()
+sys.exit(0 if ok else 7)
+"""
 
+
+@pytest.fixture
+def protected_origin(tmp_path, origin_repo, git):
+    """origin_repo plus tests/check.py and tests/helper.py on main."""
+    work = tmp_path / "add-tests"
+    git(tmp_path, "clone", str(origin_repo), str(work))
+    (work / "tests").mkdir()
+    (work / "tests" / "check.py").write_text(ORIGINAL_CHECK, encoding="utf-8")
+    (work / "tests" / "helper.py").write_text("HELP = 1\n", encoding="utf-8")
+    git(work, "add", "-A")
+    git(work, "commit", "-m", "add tests")
+    git(work, "push", "origin", "main")
+    return origin_repo
+
+
+def test_protected_paths_are_reverted_before_tests_and_push(tmp_path, protected_origin, fake_agent, git):
+    fake_agent["mode"] = "tamper"
+    runner = TaskRunner(tmp_path / "ws")
+    req = dispatch(runner, protected_origin, protect_paths=["tests/"],
+                   test_command=f'"{sys.executable}" tests/check.py')
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "succeeded", st.error
+    assert sorted(st.protected_reverted) == ["tests/check.py", "tests/helper.py", "tests/new_test.py"]
+    # The test ran the original check.py, with the deleted helper back and the added file gone.
+    assert st.test_exit_code == 0
+    assert "original check ran" in (tmp_path / "ws" / "r1" / ".hive" / "test.log").read_text(encoding="utf-8")
+    assert git(protected_origin, "diff", "--name-only", "main", req.branch).splitlines() == ["feature.txt"]
+    wrapper = (tmp_path / "ws" / "r1" / ".hive" / "wrapper.log").read_text(encoding="utf-8")
+    assert "Reverted agent changes to protected files" in wrapper
+
+
+def test_only_protected_changes_means_no_changes(tmp_path, protected_origin, fake_agent, git):
+    fake_agent["mode"] = "tamper_only"
+    runner = TaskRunner(tmp_path / "ws")
+    req = dispatch(runner, protected_origin, protect_paths=["tests/check.py", "not/there"],
+                   test_command=f'"{sys.executable}" tests/check.py')
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "no_changes", st.error
+    assert st.protected_reverted == ["tests/check.py"]
+    assert git(protected_origin, "branch", "--list", req.branch) == ""
+
+
+def test_protect_without_agent_changes_reports_empty_list(tmp_path, protected_origin, fake_agent):
+    runner = TaskRunner(tmp_path / "ws")
+    dispatch(runner, protected_origin, protect_paths=["tests"])
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "succeeded", st.error
+    assert st.protected_reverted == []

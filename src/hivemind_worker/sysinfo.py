@@ -11,7 +11,7 @@ from hivemind_worker.models import HealthResponse
 # Advertised in /health so masters can refuse to use a feature on a worker that would
 # silently ignore it (unknown dispatch fields are dropped, so an old worker given a
 # base_branch would quietly start from the default branch).
-WORKER_FEATURES = ["base_branch", "logs"]
+WORKER_FEATURES = ["base_branch", "logs", "protect"]
 
 
 def resolve_binary(name: str, search_path: Optional[str] = None) -> Optional[str]:
