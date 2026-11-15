@@ -148,6 +148,7 @@ def test_dispatch_request_rejects_bad_fields(overrides):
     [
         (["tests/"], ["tests"]),
         (["tasks/add/check.py", "tests", "tests/"], ["tasks/add/check.py", "tests"]),
+        (["tests/", "tests/unit/check.py"], ["tests"]),
         (["tests\\unit\\check.py"], ["tests/unit/check.py"]),
         ([], None),
     ],

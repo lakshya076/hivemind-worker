@@ -105,11 +105,17 @@ def validate_protect_path(value: str) -> str:
 
 
 def validate_protect_paths(values: Optional[List[str]]) -> Optional[List[str]]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError("protect_paths must be a list of paths, not a single string")
     if not values:
         return None
     if len(values) > MAX_PROTECT_PATHS:
         raise ValueError(f"At most {MAX_PROTECT_PATHS} protect paths are allowed")
-    return list(dict.fromkeys(validate_protect_path(v) for v in values))
+    deduped = list(dict.fromkeys(validate_protect_path(v) for v in values))
+    return [
+        p for p in deduped
+        if not any(other != p and p.lower().startswith(other.lower() + "/") for other in deduped)
+    ]
 
 
 class DispatchRequest(BaseModel):

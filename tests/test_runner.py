@@ -789,3 +789,16 @@ def test_agent_committing_only_protected_changes_ends_no_changes(tmp_path, prote
     assert st.status == "no_changes", st.error
     assert st.protected_reverted == ["tests/check.py"]
     assert git(protected_origin, "branch", "--list", req.branch) == ""
+
+
+def test_protect_paths_matches_case_insensitively(tmp_path, protected_origin, fake_agent, git):
+    fake_agent["mode"] = "tamper"
+    runner = TaskRunner(tmp_path / "ws")
+    req = dispatch(runner, protected_origin, protect_paths=["Tests/"],
+                   test_command=f'"{sys.executable}" tests/check.py')
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "succeeded", st.error
+    assert sorted(st.protected_reverted) == ["tests/check.py", "tests/helper.py", "tests/new_test.py"]
+    assert git(protected_origin, "diff", "--name-only", "main", req.branch).splitlines() == ["feature.txt"]
