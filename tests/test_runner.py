@@ -279,17 +279,48 @@ subprocess.run(["git", "commit", "-qm", "sneaky"])
 def test_only_the_agents_changes_are_pushed(tmp_path, origin_repo, fake_agent, git):
     script = tmp_path / "leaves_files.py"
     script.write_text(TEST_LEAVES_FILES, encoding="utf-8")
+    bench_script = tmp_path / "check_bench_tree.py"
+    bench_script.write_text(
+        'import json, pathlib\n'
+        'print(json.dumps({"feature": pathlib.Path("feature.txt").read_text().strip(), '
+        '"has_coverage": pathlib.Path(".coverage").exists()}))\n',
+        encoding="utf-8",
+    )
     runner = TaskRunner(tmp_path / "ws")
-    req = dispatch(runner, origin_repo, test_command=f'"{sys.executable}" "{script}"')
+    req = dispatch(
+        runner,
+        origin_repo,
+        test_command=f'"{sys.executable}" "{script}"',
+        bench_command=f'"{sys.executable}" "{bench_script}"',
+    )
 
     st = wait_for(runner, "r1")
 
     assert st.status == "succeeded", st.error
+    assert st.benchmark_data == {"feature": "done", "has_coverage": False}
     assert st.commit == git(origin_repo, "rev-parse", f"refs/heads/{req.branch}")
     files = git(origin_repo, "ls-tree", "-r", "--name-only", req.branch).splitlines()
     assert ".coverage" not in files
     assert git(origin_repo, "show", f"{req.branch}:feature.txt") == "done"
     assert git(origin_repo, "log", "--format=%s", "-1", req.branch).startswith("hive: simd")
+
+
+def test_git_commit_failure_reports_failed_not_no_changes(tmp_path, origin_repo, fake_agent, monkeypatch):
+    runner = TaskRunner(tmp_path / "ws")
+    orig_run_git_cmd = runner._run_git_cmd
+
+    def fail_on_commit(run_id, args, **kwargs):
+        if "commit" in args:
+            return subprocess.CompletedProcess(args, 128, stdout="", stderr="fatal: unable to write new_index file")
+        return orig_run_git_cmd(run_id, args, **kwargs)
+
+    monkeypatch.setattr(runner, "_run_git_cmd", fail_on_commit)
+    dispatch(runner, origin_repo)
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "failed"
+    assert "Git commit failed" in (st.error or "")
 
 
 def test_agent_failure_reports_exit_code(tmp_path, origin_repo, fake_agent):
