@@ -725,6 +725,31 @@ class TaskRunner:
                 raise RuntimeError(f"Restoring protected paths failed (git {args[0]}): {detail}")
             return res
 
+        # Remove any symlinks, NTFS junctions, or hardlinks planted by the agent along or inside
+        # protected paths before git touches them.
+        lower_prefixes = [p.lower() for p in paths]
+
+        def _matches_protected(rel_posix: str) -> bool:
+            low = rel_posix.lower()
+            return any(low == lp or low.startswith(lp + "/") for lp in lower_prefixes)
+
+        for entry in list(run_dir.rglob("*")):
+            try:
+                rel = entry.relative_to(run_dir).as_posix()
+            except ValueError:
+                continue
+            if rel.startswith(".git/") or rel == ".git" or rel.startswith(".hive/") or rel == ".hive":
+                continue
+            if _matches_protected(rel):
+                if _is_link_or_junction(entry):
+                    self._remove_entry_readonly_safe(entry)
+                elif entry.is_file():
+                    try:
+                        if entry.stat().st_nlink > 1:
+                            self._remove_entry_readonly_safe(entry)
+                    except OSError:
+                        pass
+
         # If the agent ran `git commit`, move HEAD back to base_head (keeping index/worktree)
         # so reverting protected files does not leave a dirty index against the agent's commit
         # or leave tampered protected files in intermediate commit history.
@@ -732,20 +757,22 @@ class TaskRunner:
             run("reset", "--soft", base_head)
 
         # Stage everything so files the agent added count as changes (and are removed below).
+        # Filter in Python case-insensitively so case-renamed paths (e.g. Tests/ vs tests/) are caught too.
         run("add", "-A")
-        diff = run("diff", "--cached", "--name-only", "--no-renames", "-z", base_head, "--", *paths)
-        changed = [name for name in diff.stdout.split("\0") if name]
+        diff = run("diff", "--cached", "--name-only", "--no-renames", "-z", base_head)
+        changed = [name for name in diff.stdout.split("\0") if name and _matches_protected(name)]
         if changed:
-            ls_base = run("ls-tree", "-r", "--name-only", "-z", base_head, "--", *paths)
-            in_base = {name for name in ls_base.stdout.split("\0") if name}
+            ls_base = run("ls-tree", "-r", "--name-only", "-z", base_head)
+            in_base = {name for name in ls_base.stdout.split("\0") if name and _matches_protected(name)}
             to_restore = [name for name in changed if name in in_base]
             to_remove = [name for name in changed if name not in in_base]
-            if to_restore:
-                run("restore", f"--source={base_head}", "--staged", "--worktree", "--", *to_restore)
             if to_remove:
                 run("rm", "-rfq", "--", *to_remove)
+            if to_restore:
+                run("restore", f"--source={base_head}", "--staged", "--worktree", "--", *to_restore)
         # Ignored files are never committed but could still change what the test command sees.
-        run("clean", "-fdqx", "-e", ".hive", "-e", "result.json", "--", *paths)
+        clean_targets = list(dict.fromkeys([*paths, *(name.split("/")[0] for name in changed)]))
+        run("clean", "-fdqx", "-e", ".hive", "-e", "result.json", "--", *clean_targets)
         return changed
 
     def _ensure_mirror(self, repo_url: str, env: Dict[str, str]) -> Optional[Path]:
