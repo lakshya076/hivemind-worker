@@ -802,3 +802,44 @@ def test_protect_paths_matches_case_insensitively(tmp_path, protected_origin, fa
     assert st.status == "succeeded", st.error
     assert sorted(st.protected_reverted) == ["tests/check.py", "tests/helper.py", "tests/new_test.py"]
     assert git(protected_origin, "diff", "--name-only", "main", req.branch).splitlines() == ["feature.txt"]
+
+
+def test_strategy_hint_and_diff_stats_reported(tmp_path, origin_repo, fake_agent):
+    runner = TaskRunner(tmp_path / "ws")
+    dispatch(runner, origin_repo, strategy="heap", strategy_hint="use a binary min-heap")
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "succeeded", st.error
+    prompt_txt = (tmp_path / "ws" / "r1" / ".hive" / "prompt.txt").read_text(encoding="utf-8")
+    assert "Strategy hint: use a binary min-heap\n" in prompt_txt
+    assert st.files_changed == 1
+    assert st.insertions >= 1
+    assert st.deletions == 0
+
+
+def test_per_dispatch_timeout_overrides_and_clamps(tmp_path, origin_repo, fake_agent):
+    fake_agent["mode"] = "sleep"
+    runner = TaskRunner(tmp_path / "ws", agent_timeout=30.0)
+    dispatch(runner, origin_repo, agent_timeout=1.0)
+
+    st = wait_for(runner, "r1")
+
+    assert st.status == "failed"
+    assert st.error == "Agent timed out after 1s"
+
+
+def test_build_agent_command_passes_claude_allowed_tools(tmp_path):
+    from hivemind_worker.agent import build_agent_command
+
+    cmd = build_agent_command(
+        "claude-code",
+        tmp_path / "prompt.txt",
+        "hello",
+        model="claude-sonnet-4-6",
+        claude_allowed_tools=["Bash(pytest:*)", "Read"],
+    )
+    assert "--allowedTools" in cmd.args
+    idx = cmd.args.index("--allowedTools")
+    assert cmd.args[idx + 1 : idx + 3] == ["Bash(pytest:*)", "Read"]
+

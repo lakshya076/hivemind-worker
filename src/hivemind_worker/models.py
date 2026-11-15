@@ -118,12 +118,33 @@ def validate_protect_paths(values: Optional[List[str]]) -> Optional[List[str]]:
     ]
 
 
+MAX_STRATEGY_HINT_CHARS = 2000
+
+
+def validate_strategy_hint(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > MAX_STRATEGY_HINT_CHARS or any(
+        (ord(ch) < 0x20 and ch not in ("\t", "\n", "\r")) or ord(ch) == 0x7F for ch in cleaned
+    ):
+        raise ValueError(f"Invalid strategy_hint: max {MAX_STRATEGY_HINT_CHARS} characters, no control characters")
+    return cleaned
+
+
 class DispatchRequest(BaseModel):
     """Payload sent by HiveMind master to trigger a task run."""
     run_id: str = Field(..., description="Unique identifier for the task run")
     repo_url: str = Field(..., max_length=2048, description="Git remote repository URL")
     prompt: str = Field(..., min_length=1, max_length=200_000, description="Core task prompt or instruction")
     strategy: str = Field(default="strategy-1", min_length=1, max_length=256, description="Assigned strategy name")
+    strategy_hint: Optional[str] = Field(
+        default=None,
+        max_length=4096,
+        description="Optional instructions specific to this strategy",
+    )
     strategy_index: int = Field(default=1, ge=1, le=1000, description="1-based index of current strategy")
     strategy_count: int = Field(default=1, ge=1, le=1000, description="Total number of parallel strategies")
     branch: Optional[str] = Field(default=None, description="Target branch to push (e.g. exp/worker-1-strategy)")
@@ -139,8 +160,25 @@ class DispatchRequest(BaseModel):
         default=None,
         description="Repo-relative files or directories (e.g. tests/) restored to the base after the agent runs",
     )
+    agent_timeout: Optional[float] = Field(
+        default=None,
+        gt=0,
+        le=86400,
+        description="Optional per-dispatch agent timeout in seconds (clamped to worker's agent_timeout)",
+    )
+    test_timeout: Optional[float] = Field(
+        default=None,
+        gt=0,
+        le=86400,
+        description="Optional per-dispatch test/bench timeout in seconds (clamped to worker's test_timeout)",
+    )
     # No workspace_dir: runs are always confined to the worker's workspace_root. Older
     # masters that still send it are fine, because unknown fields are ignored.
+
+    @field_validator("strategy_hint")
+    @classmethod
+    def _check_strategy_hint(cls, value: Optional[str]) -> Optional[str]:
+        return validate_strategy_hint(value)
 
     @field_validator("agent_engine")
     @classmethod
@@ -213,6 +251,9 @@ class StatusResponse(BaseModel):
         default=None,
         description="Protected files the agent changed; they were restored to the base before tests and commit",
     )
+    files_changed: Optional[int] = Field(default=None, description="Files changed in the agent's commit vs base")
+    insertions: Optional[int] = Field(default=None, description="Lines added in the agent's commit vs base")
+    deletions: Optional[int] = Field(default=None, description="Lines deleted in the agent's commit vs base")
     benchmark_data: Optional[Any] = None
     error: Optional[str] = None
     log_tail: Optional[str] = None
@@ -227,6 +268,7 @@ class HealthResponse(BaseModel):
     arch: str
     cpu_cores: int
     ram_gb: float
+    disk_free_gb: Optional[float] = Field(default=None, description="Free disk space in GiB on the workspace volume")
     engines: List[str]
     git_ready: bool
     version: str

@@ -64,6 +64,7 @@ def create_app(
         git_timeout=app_config.git_timeout,
         max_concurrent_runs=app_config.max_concurrent_runs,
         max_retained_workspaces=app_config.max_retained_workspaces,
+        claude_allowed_tools=app_config.claude_allowed_tools,
     )
 
     allowed_networks = parse_networks(
@@ -181,7 +182,7 @@ def create_app(
     def health():
         """Instant hardware and capability probe endpoint."""
         active = runner.get_active_run_ids()
-        return get_system_health(active_runs=active)
+        return get_system_health(active_runs=active, workspace_root=workspace_root)
 
     @app.post("/dispatch", response_model=DispatchResponse, tags=["Execution"], dependencies=[Depends(verify_auth)])
     def dispatch(req: DispatchRequest):

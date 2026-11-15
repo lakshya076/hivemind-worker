@@ -68,6 +68,7 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
 | `agent_timeout` | `1800` | Seconds an agent session may run before its process tree is killed |
 | `test_timeout` | `300` | Seconds each test or benchmark command may run before it is killed |
 | `git_timeout` | `300` | Seconds each git clone, fetch or push may run before it is killed |
+| `claude_allowed_tools` | `null` | Optional list of Claude Code `--allowedTools` specs (e.g. `["Bash(pytest:*)"]`). Opt-in per worker |
 
 ---
 
@@ -76,16 +77,16 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
 | `GET` | `/` | none | Identifies the daemon (`name`, `version`). `hive discover` uses it to find workers without sending the key |
-| `GET` | `/health` | key | Hardware and tool capability probe (<0.1s response) |
+| `GET` | `/health` | key | Hardware and tool capability probe (<0.1s response, including `disk_free_gb` on the workspace volume) |
 | `POST` | `/dispatch` | key | Dispatches an AI agent run in an isolated workspace |
-| `GET` | `/status/{run_id}` | key | Polls live status, git branch, test results, and log tail |
+| `GET` | `/status/{run_id}` | key | Polls live status, git branch, diff stats (`files_changed`, `insertions`, `deletions`), test results, and log tail |
 | `GET` | `/logs/{run_id}?file=agent\|test\|bench\|wrapper&max_bytes=N` | key | The end of one of the run's logs: `{run_id, file, size, truncated, content}`. `max_bytes` defaults to 1 MiB, at most 5 MiB. 404 if the run or that log doesn't exist |
 | `DELETE` | `/cancel/{run_id}` | key | Aborts a queued or running task and terminates its process tree |
 | `GET` | `/runs` | key | Lists all historical and active runs |
 
-`/health` lists optional features in `features` (currently `base_branch`, `logs` and `protect`). Unknown dispatch fields are ignored, so an older worker given a `base_branch` or `protect_paths` would quietly start from the default branch or leave the tests editable; the master checks this list first and refuses instead.
+`/health` lists optional features in `features` (currently `base_branch`, `logs`, `protect`, `strategy_hint`, and `timeout`). Unknown dispatch fields are ignored, so an older worker given a `base_branch` or `protect_paths` would quietly start from the default branch or leave the tests editable; the master checks this list first and refuses instead.
 
-`/dispatch` rejects invalid payloads with HTTP 422 before anything touches disk: a `run_id` that is not 1–128 characters of `[A-Za-z0-9._-]` (or contains `..`), a `repo_url` or `branch` that could be read as a git option or remote helper, a `branch` outside `exp/` (the worker force-pushes it, so it must never be `main` or another real branch), an `agent_engine` other than `claude-code`, `claude`, `agy` or `aider`, a model name with characters outside `[A-Za-z0-9._:/@+-]` or not starting with a letter or digit, a `protect_paths` entry that is not a relative path inside the repository (absolute, drive letter, `..`, `.`, `.git`, leading `-` or `:`, control characters, over 512 characters, or more than 32 entries), and oversized fields (prompt over 200,000 characters, `repo_url` over 2,048, test or bench command over 4,096).
+`/dispatch` rejects invalid payloads with HTTP 422 before anything touches disk: a `run_id` that is not 1–128 characters of `[A-Za-z0-9._-]` (or contains `..`), a `repo_url` or `branch` that could be read as a git option or remote helper, a `branch` outside `exp/` (the worker force-pushes it, so it must never be `main` or another real branch), an `agent_engine` other than `claude-code`, `claude`, `agy` or `aider`, a model name with characters outside `[A-Za-z0-9._:/@+-]` or not starting with a letter or digit, a `strategy_hint` containing control characters or over 2,000 characters, a `protect_paths` entry that is not a relative path inside the repository (absolute, drive letter, `..`, `.`, `.git`, leading `-` or `:`, control characters, over 512 characters, or more than 32 entries), `agent_timeout` or `test_timeout` outside `1..86400` seconds (clamped at runtime to the worker's configured ceiling), and oversized fields (prompt over 200,000 characters, `repo_url` over 2,048, test or bench command over 4,096).
 
 ---
 
@@ -94,16 +95,16 @@ Settings live in `~/.hivemind/worker.json` (owner-only permissions on Linux/macO
 1. **Queue.** The run starts as `starting` and waits for one of `max_concurrent_runs` slots. A queued run can be cancelled before it starts.
 2. **Workspace.** The run gets `<workspace_root>/<run_id>/`. Every run starts from a fresh clone: anything already in that directory (for example a `.git` left by an earlier run with the same ID) is deleted first. Each `repo_url` is cached as a bare mirror in `<workspace_root>/.mirrors/`, so later clones are local and fast; `origin` still points at `repo_url`. If refreshing the mirror fails, the worker clones straight from `repo_url`, so it never works on a stale copy. If that fails too, the run fails with git's error before the agent starts. Clones, fetches and the final push are killed after `git_timeout` seconds, and cancelling a run also stops a clone or push in progress.
 3. **Branch.** The worker checks out the branch the master sends (`exp/<run_id>/<worker>-<strategy>`). It starts from `base_branch` if the master sends one (any valid branch on origin; the run fails if it doesn't exist, never falling back). Otherwise it starts from the remote default branch (`origin/HEAD`, then `origin/main`, then `origin/master`). `/status` reports the base actually used in `base_branch`. If the master sends no branch, the worker uses `exp/<first 12 characters of run_id>-worker-<strategy>`. Worker and agent files (`.hive/`, `.agy/`, `.aider*`, `result.json`, `__pycache__/`) are listed in `.git/info/exclude`, so the repository's `.gitignore` is never changed.
-4. **Agent.** `.hive/prompt.txt` gets a fixed header naming the strategy, then `Task:` and the master's prompt. The header means the file never starts with the task text, which matters because aider runs a message starting with `/` or `!` as a command, and Claude Code treats a leading `/` as a slash command.
+4. **Agent.** `.hive/prompt.txt` gets a fixed header naming the strategy (and `Strategy hint: <hint>` when `strategy_hint` is provided), then `Task:` and the master's prompt. The header means the file never starts with the task text, which matters because aider runs a message starting with `/` or `!` as a command, and Claude Code treats a leading `/` as a slash command.
    - Aider reads it with `--message-file`. It runs with `--yes-always`, which accepts every routine prompt. So the worker also turns off the prompts it must never accept: self-upgrade via pip (`--no-check-update`), fetching URLs found in the prompt (`--no-detect-urls`), editing `.gitignore` (`--no-gitignore`), and the analytics opt-in (`--no-analytics`).
-   - Claude Code reads it from stdin and runs with `--permission-mode acceptEdits`, so it can edit files but not run shell commands.
+   - Claude Code reads it from stdin and runs with `--permission-mode acceptEdits`, so it can edit files but not run shell commands unless the worker operator explicitly configures `claude_allowed_tools` in `worker.json` (passed as `--allowedTools`).
    - `agy` takes the prompt as an argument, so it must be a native executable. The worker refuses to pass a prompt to a `.cmd`/`.bat` shim.
    - On Windows, `.cmd` shims (such as npm's `claude.cmd`) are started through `cmd.exe` with the whole command quoted, so install paths with spaces (`C:\Users\John Smith\...`) work.
    - `/health` and the runner find agent CLIs the same way: `PATH` first, then the usual install folders (`~/.local/bin`, `~/.cargo/bin`, npm's global folder on Windows). The worker never reports an engine it can't start, even when a service runs with a minimal `PATH`.
-   - No agent is ever started through a shell. The agent is killed with its whole process tree after `agent_timeout` seconds.
+   - No agent is ever started through a shell. The agent is killed with its whole process tree after `min(req.agent_timeout, agent_timeout)` seconds.
 5. **Protected paths.** If the master sent `protect_paths` (files or directories relative to the repository root, e.g. `tests/`), every protected path is put back exactly as it is on the base: edited or deleted files are restored, and files the agent added there (including ignored ones) are removed. Agent changes are compared with the base commit, so a commit the agent made itself is caught too. The files the agent had changed are listed in `/status` as `protected_reverted` and in `wrapper.log`. The test command therefore always runs the original tests, and the pushed commit never touches protected paths.
-6. **Commit.** As soon as the agent exits, its changes are committed as `hive: <strategy> (run <run_id>)`. If it changed no files (or only protected ones), the run ends `no_changes` here: tests and benchmark are skipped, because they would only test the unchanged base branch.
-7. **Tests and benchmark.** `test_command` and `bench_command` run in the workspace and are killed after `test_timeout` seconds. Benchmark output is parsed as JSON; output that is not JSON is kept as `{"raw_output": ...}`. Output over 64 KiB is not read whole: only its last lines are kept, marked `[benchmark output truncated: <size> bytes]`.
+6. **Commit.** As soon as the agent exits, its changes are committed as `hive: <strategy> (run <run_id>)`, and the worker records `files_changed`, `insertions`, and `deletions` against the base commit in `/status`. If it changed no files (or only protected ones), the run ends `no_changes` here: tests and benchmark are skipped, because they would only test the unchanged base branch.
+7. **Tests and benchmark.** `test_command` and `bench_command` run in the workspace and are killed after `min(req.test_timeout, test_timeout)` seconds. Benchmark output is parsed as JSON; output that is not JSON is kept as `{"raw_output": ...}`. Output over 64 KiB is not read whole: only its last lines are kept, marked `[benchmark output truncated: <size> bytes]`.
 8. **Push.** Exactly the agent's commit is force-pushed to the branch. Files the tests or benchmark create (`.coverage`, build output) and anything they commit are never pushed.
 9. **Result.** The final status is written to `<run_id>/result.json`, readable only by the worker's user on Linux/macOS. Logs stay in `<run_id>/.hive/` (`wrapper.log`, `agent.log`, `test.log`, `bench.log`).
 
@@ -199,6 +200,35 @@ Passing the key with `hivemind-worker start --key <KEY>` still works but is depr
    ```bash
    journalctl -u hivemind-worker -f
    ```
+
+#### Without `sudo`: systemd user service
+
+When you don't have root on the worker (for example a shared lab server), run a user unit instead:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/hivemind-worker.service <<'EOF'
+[Unit]
+Description=HiveMind Worker Daemon
+After=network.target
+
+[Service]
+Type=simple
+Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=%h/.local/bin/hivemind-worker start
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now hivemind-worker
+journalctl --user -u hivemind-worker -f
+```
+
+A user service runs while you are logged in. To keep it running after you log out (and start it at boot), enable lingering for your account if the admin allows it: `loginctl enable-linger $USER`.
 
 ---
 

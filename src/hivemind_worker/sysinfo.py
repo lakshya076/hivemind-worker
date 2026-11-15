@@ -11,7 +11,7 @@ from hivemind_worker.models import HealthResponse
 # Advertised in /health so masters can refuse to use a feature on a worker that would
 # silently ignore it (unknown dispatch fields are dropped, so an old worker given a
 # base_branch would quietly start from the default branch).
-WORKER_FEATURES = ["base_branch", "logs", "protect"]
+WORKER_FEATURES = ["base_branch", "logs", "protect", "strategy_hint", "timeout"]
 
 
 def resolve_binary(name: str, search_path: Optional[str] = None) -> Optional[str]:
@@ -60,7 +60,10 @@ def detect_installed_engines() -> List[str]:
     return engines
 
 
-def get_system_health(active_runs: List[str] = None) -> HealthResponse:
+def get_system_health(
+    active_runs: List[str] = None,
+    workspace_root: Optional[Path] = None,
+) -> HealthResponse:
     """Collect real-time system metrics, hardware specs, and agent readiness."""
     active_runs = active_runs or []
     os_name = platform.system().lower()
@@ -73,6 +76,13 @@ def get_system_health(active_runs: List[str] = None) -> HealthResponse:
     except Exception:
         ram_gb = 0.0
 
+    disk_free_gb: Optional[float] = None
+    try:
+        probe_dir = workspace_root if (workspace_root and workspace_root.exists()) else Path.home()
+        disk_free_gb = round(shutil.disk_usage(probe_dir).free / (1024 ** 3), 1)
+    except Exception:
+        disk_free_gb = None
+
     engines = detect_installed_engines()
     git_ready = is_tool_installed("git")
 
@@ -84,6 +94,7 @@ def get_system_health(active_runs: List[str] = None) -> HealthResponse:
         arch=arch,
         cpu_cores=cpu_cores,
         ram_gb=ram_gb,
+        disk_free_gb=disk_free_gb,
         engines=engines,
         git_ready=git_ready,
         version=__version__,

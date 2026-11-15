@@ -79,9 +79,12 @@ def test_health_with_key(app):
 
 
 def test_health_advertises_features(app):
-    # Masters refuse --base / --protect / full logs on workers that don't list them.
-    features = set(client_for(app).get("/health", headers=AUTH).json()["features"])
-    assert features >= {"base_branch", "logs", "protect"}
+    # Masters refuse --base / --protect / full logs / strategy_hint / timeout on workers that don't list them.
+    health = client_for(app).get("/health", headers=AUTH).json()
+    features = set(health["features"])
+    assert features >= {"base_branch", "logs", "protect", "strategy_hint", "timeout"}
+    assert isinstance(health.get("disk_free_gb"), (int, float))
+    assert health["disk_free_gb"] > 0
 
 
 def test_logs_endpoint(app, tmp_path):
@@ -170,6 +173,17 @@ def test_unknown_runs_return_404(app):
 
 
 def test_config_timeouts_reach_the_runner(tmp_path):
-    app = make_app(tmp_path, agent_timeout=42, test_timeout=7, max_concurrent_runs=3)
+    app = make_app(
+        tmp_path,
+        agent_timeout=42,
+        test_timeout=7,
+        max_concurrent_runs=3,
+        claude_allowed_tools=["Bash(pytest:*)", "Read"],
+    )
     runner = app.state.runner
     assert (runner.agent_timeout, runner.test_timeout, runner.max_concurrent_runs) == (42, 7, 3)
+    assert runner.claude_allowed_tools == ["Bash(pytest:*)", "Read"]
+
+    with pytest.raises(Exception):
+        WorkerConfig(fleet_key=FLEET_KEY, claude_allowed_tools=["--dangerously-skip-permissions"])
+

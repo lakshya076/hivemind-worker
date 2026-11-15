@@ -170,3 +170,20 @@ def test_bad_protect_paths_rejected(path):
 def test_too_many_protect_paths_rejected():
     with pytest.raises(ValidationError):
         base_request(protect_paths=[f"t{i}" for i in range(33)])
+
+
+def test_strategy_hint_and_timeouts_validated():
+    req = base_request(strategy_hint="  use a binary heap  ", agent_timeout=120, test_timeout=60)
+    assert req.strategy_hint == "use a binary heap"
+    assert req.agent_timeout == 120.0
+    assert req.test_timeout == 60.0
+
+    assert base_request(strategy_hint="   ").strategy_hint is None
+
+    with pytest.raises(ValidationError):
+        base_request(strategy_hint="bad\x00hint")
+    with pytest.raises(ValidationError):
+        base_request(agent_timeout=0)
+    with pytest.raises(ValidationError):
+        base_request(test_timeout=90000)
+
